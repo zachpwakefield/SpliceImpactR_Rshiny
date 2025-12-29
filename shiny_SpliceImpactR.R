@@ -259,6 +259,7 @@ server <- function(input, output, session) {
     sample_frame = NULL,
     splicing = NULL,
     di = NULL,
+    di_norm = NULL,
     di_sig = NULL,
     matched = NULL,
     protein_features = NULL,
@@ -414,8 +415,12 @@ server <- function(input, output, session) {
         parallel_glm = FALSE,
         verbose = FALSE
       )
-      rv$di_sig <- keep_sig_pairs(rv$di, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
-      rv$matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
+      rv$di_norm <- normalize_di_cols(rv$di)
+      rv$di_sig <- if (!is.null(rv$di_norm)) keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr) else NULL
+      if (!is.null(rv$di_sig)) {
+        matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
+        rv$matched <- merge(matched, rv$di_norm[, .(event_id, delta_psi)], by = "event_id", all.x = TRUE)
+      }
       
       incProgress(0.8, detail = "PPI (demo PPIDM)")
       rv$ppidm <- get_ppidm(test = TRUE)
@@ -451,6 +456,7 @@ server <- function(input, output, session) {
       )
       rv$splicing <- data
       rv$di <- NULL
+      rv$di_norm <- NULL
       rv$di_sig <- NULL
       rv$matched <- NULL
       rv$protein_features <- NULL
@@ -541,19 +547,20 @@ server <- function(input, output, session) {
         verbose = FALSE
       )
       rv$di <- di
-      rv$di_sig <- keep_sig_pairs(di, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
+      rv$di_norm <- normalize_di_cols(di)
+      rv$di_sig <- if (!is.null(rv$di_norm)) keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr) else NULL
       rv$matched <- NULL
       incProgress(1, detail = "Differential inclusion complete")
     })
   })
   
   observeEvent(input$map_events, {
-    req(rv$di, rv$annotations)
+    req(rv$di_norm, rv$annotations)
     withProgress(message = "Matching events to transcripts", value = 0, {
-      rv$di_sig <- keep_sig_pairs(rv$di, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
+      rv$di_sig <- keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
       req(rv$di_sig)
       matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
-      rv$matched <- matched
+      rv$matched <- merge(matched, rv$di_norm[, .(event_id, delta_psi)], by = "event_id", all.x = TRUE)
       incProgress(1, detail = "Mapping complete")
     })
   })
@@ -594,8 +601,8 @@ server <- function(input, output, session) {
   })
   
   output$di_table <- renderTable({
-    req(rv$di)
-    sig <- normalize_di_cols(rv$di)
+    req(rv$di_norm)
+    sig <- rv$di_norm
     if (is.null(sig)) {
       showNotification("Differential inclusion results missing padj or delta_psi.", type = "error")
       return(NULL)
@@ -721,8 +728,8 @@ server <- function(input, output, session) {
   output$download_di <- downloadHandler(
     filename = function() paste0("spliceimpactr_di_results_", Sys.Date(), ".csv"),
     content = function(file) {
-      req(rv$di)
-      fwrite(rv$di, file)
+      req(rv$di_norm)
+      fwrite(rv$di_norm, file)
     }
   )
   
