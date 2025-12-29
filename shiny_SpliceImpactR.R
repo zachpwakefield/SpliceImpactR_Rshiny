@@ -102,7 +102,11 @@ ui <- fluidPage(
       hr(),
       h4("Sequence/domain + PPI"),
       helpText("Run after mapping and loading proteins/PPIs to populate Protein consequences, PPI, and Integrative tabs."),
-      actionButton("run_downstream", "Run sequence/domain + PPI summary", width = "100%")
+      actionButton("run_downstream", "Run sequence/domain + PPI summary", width = "100%"),
+      hr(),
+      h4("HIT/PSI comparisons"),
+      helpText("Compute HIT index and PSI comparisons across conditions."),
+      actionButton("run_hit_overview_sidebar", "Run HIT/PSI summaries", width = "100%")
     ),
     mainPanel(
       width = 8,
@@ -222,6 +226,37 @@ ui <- fluidPage(
           tableOutput("domain_table")
         ),
         tabPanel(
+          "PPI",
+          textInput("ppi_gene_filter", "Gene filter (PPI tab)", value = "", placeholder = "Overrides global gene filter"),
+          helpText("Run sequence/domain plots with PPIs loaded to populate this tab."),
+          helpText("n_ppi = total unique partner transcripts per event (from PPIDM). partners = sample of partner transcript IDs."),
+          h4("PPI impact summary"),
+          plotOutput("ppi_plot", height = 350),
+          downloadButton("download_ppi_plot", "Download PPI plot"),
+          tableOutput("ppi_summary"),
+          tableOutput("ppi_gene_table"),
+          actionButton("show_ppi_table", "Show full PPI table")
+        ),
+        tabPanel(
+          "Event probe",
+          helpText("Select an event ID from DI results to probe PSI by sample/condition."),
+          selectizeInput("probe_event", "Event ID", choices = NULL, options = list(placeholder = "Select event_id")),
+          actionButton("run_probe", "Probe event", width = "100%"),
+          h4("PSI by sample/condition"),
+          plotOutput("probe_plot", height = 350)
+        ),
+        tabPanel(
+          "HIT/PSI summaries",
+          helpText("Run HIT index and PSI overview comparisons across conditions."),
+          actionButton("run_hit_overview", "Run HIT/PSI summaries", width = "100%"),
+          h4("HIT index comparison"),
+          plotOutput("hit_compare_plot", height = 400),
+          h4("PSI overview (AFE example)"),
+          plotOutput("psi_overview_plot", height = 400),
+          h4("Proximal vs distal (AFE/ALE)"),
+          plotOutput("proximal_plot", height = 300)
+        ),
+        tabPanel(
           "Integrative summary",
           actionButton("run_integrative", "Run integrative summary", width = "100%"),
           plotOutput("integrative_plot", height = 600),
@@ -239,18 +274,6 @@ ui <- fluidPage(
           downloadButton("download_di", "Download differential inclusion results"),
           downloadButton("download_mapping", "Download event-to-transcript map"),
           downloadButton("download_proteins", "Download protein consequence table")
-        ),
-         tabPanel(
-          "PPI",
-          textInput("ppi_gene_filter", "Gene filter (PPI tab)", value = "", placeholder = "Overrides global gene filter"),
-          helpText("Run sequence/domain plots with PPIs loaded to populate this tab."),
-          helpText("n_ppi = total unique partner transcripts per event (from PPIDM). partners = sample of partner transcript IDs."),
-          h4("PPI impact summary"),
-          plotOutput("ppi_plot", height = 350),
-          downloadButton("download_ppi_plot", "Download PPI plot"),
-          tableOutput("ppi_summary"),
-          tableOutput("ppi_gene_table"),
-          actionButton("show_ppi_table", "Show full PPI table")
         )
       )
     )
@@ -497,6 +520,9 @@ server <- function(input, output, session) {
       incProgress(0.8, detail = "PPI (demo PPIDM)")
       rv$ppidm <- get_ppidm(test = TRUE)
       
+      # trigger downstream run for demo
+      updateActionButton(session, "run_downstream", value = isolate(input$run_downstream) + 1)
+      
       incProgress(1, detail = "Demo ready")
     })
   })
@@ -636,6 +662,7 @@ server <- function(input, output, session) {
       req(rv$di_sig)
       matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
       rv$matched <- as.data.table(matched)
+      updateSelectizeInput(session, "probe_event", choices = unique(rv$di_norm$event_id), server = TRUE)
       incProgress(1, detail = "Mapping complete")
     })
   })
@@ -970,6 +997,11 @@ server <- function(input, output, session) {
       seq_compare <- tryCatch(compare_sequence_frame(pairs, rv$annotations$annotations),
                               error = function(e) {showNotification(paste("compare_sequence_frame failed:", e$message), type="error"); NULL})
       if (is.null(seq_compare)) return(NULL)
+      proximal_output <- tryCatch(get_proximal_shift_from_hits(pairs),
+                                  error = function(e) {showNotification(paste("get_proximal_shift_from_hits failed:", e$message), type = "error"); NULL})
+      proximal_plot <- if (!is.null(proximal_output) && nrow(proximal_output)) {
+        tryCatch(plot_prox_dist(proximal_output), error = function(e) NULL)
+      } else NULL
       alignment_plot <- tryCatch(plot_alignment_summary(seq_compare), error = function(e) NULL)
       length_plot <- tryCatch(plot_length_comparison(seq_compare), error = function(e) NULL)
       
@@ -1080,7 +1112,10 @@ server <- function(input, output, session) {
         domain_long = domain_long,
         domain_summary = domain_summary,
         hits_final = hits_final,
-        ppi_plot = ppi_plot
+        ppi_plot = ppi_plot,
+        pairs = pairs,
+        proximal_output = proximal_output,
+        proximal_plot = proximal_plot
       )
     })
   })
@@ -1101,6 +1136,12 @@ server <- function(input, output, session) {
     res <- downstream_results()
     if (is.null(res) || is.null(res$domain_plot)) return(NULL)
     res$domain_plot
+  })
+  
+  output$proximal_plot <- renderPlot({
+    res <- downstream_results()
+    if (is.null(res) || is.null(res$proximal_plot)) return(NULL)
+    res$proximal_plot
   })
   
   output$domain_table <- renderTable({
@@ -1136,11 +1177,11 @@ server <- function(input, output, session) {
   }
 )
 
-integrative_results <- eventReactive(input$run_integrative, {
-  dr <- downstream_results()
-  if (is.null(dr) || is.null(dr$hits_final) || !nrow(dr$hits_final)) {
-    showNotification("Run sequence/domain plots with PPIs loaded to compute hits_final before the integrative summary.", type = "error")
-    return(NULL)
+  integrative_results <- eventReactive(input$run_integrative, {
+    dr <- downstream_results()
+    if (is.null(dr) || is.null(dr$hits_final) || !nrow(dr$hits_final)) {
+      showNotification("Run sequence/domain plots with PPIs loaded to compute hits_final before the integrative summary.", type = "error")
+      return(NULL)
   }
   di_dt <- normalize_di_cols(rv$di)
   if (is.null(di_dt)) return(NULL)
@@ -1157,6 +1198,19 @@ integrative_results <- eventReactive(input$run_integrative, {
     res <- integrative_results()
     if (is.null(res) || is.null(res$plot)) return(NULL)
     res$plot
+  })
+  
+  hit_overview <- eventReactive(input$run_hit_overview + input$run_hit_overview_sidebar, {
+    req(rv$sample_frame, rv$splicing)
+    hc <- tryCatch(
+      compare_hit_index(rv$sample_frame, condition_map = c(control = "control", test = "case")),
+      error = function(e) {showNotification(paste("compare_hit_index failed:", e$message), type = "error"); NULL}
+    )
+    ov <- tryCatch(
+      overview_splicing_comparison_fixed(rv$splicing, rv$sample_frame, depth_norm = "exon_files", event_type = "AFE"),
+      error = function(e) {showNotification(paste("overview_splicing_comparison_fixed failed:", e$message), type = "error"); NULL}
+    )
+    list(hit = hc, overview = ov)
   })
   
   output$download_integrative_plot <- downloadHandler(
@@ -1192,6 +1246,7 @@ integrative_results <- eventReactive(input$run_integrative, {
     updateSelectizeInput(session, "pair_gene", choices = gene_choices, server = TRUE)
     updateSelectizeInput(session, "tx_a", choices = character(0), server = TRUE)
     updateSelectizeInput(session, "tx_b", choices = character(0), server = TRUE)
+    updateSelectizeInput(session, "probe_event", choices = if (!is.null(rv$di_norm)) unique(rv$di_norm$event_id) else NULL, server = TRUE)
   }, ignoreNULL = TRUE)
   
   observeEvent(input$pair_gene, {
@@ -1201,6 +1256,22 @@ integrative_results <- eventReactive(input$run_integrative, {
     updateSelectizeInput(session, "tx_a", choices = tx_choices, server = TRUE, selected = NULL)
     updateSelectizeInput(session, "tx_b", choices = tx_choices, server = TRUE, selected = NULL)
   }, ignoreInit = TRUE)
+  
+  probe_event_plot <- eventReactive(input$run_probe, {
+    req(rv$di_norm)
+    evt <- input$probe_event
+    if (!nzchar(evt)) {
+      showNotification("Select an event ID to probe.", type = "warning")
+      return(NULL)
+    }
+    tryCatch(
+      probe_individual_event(rv$di_norm, event = evt),
+      error = function(e) {
+        showNotification(paste("probe_individual_event failed:", e$message), type = "error")
+        NULL
+      }
+    )
+  })
   
   pair_query <- eventReactive(input$run_pair_query, {
     if (is.null(rv$exon_features) || !nrow(rv$exon_features)) {
@@ -1308,6 +1379,22 @@ integrative_results <- eventReactive(input$run_integrative, {
     diffs[, .(status, transcript_id, database, name, alt_name)][
       order(status, database, name)
     ][1:min(.N, 100)]
+  })
+  
+  output$hit_compare_plot <- renderPlot({
+    res <- hit_overview()
+    if (is.null(res) || is.null(res$hit$plot)) return(NULL)
+    res$hit$plot
+  })
+  
+  output$psi_overview_plot <- renderPlot({
+    res <- hit_overview()
+    if (is.null(res) || is.null(res$overview)) return(NULL)
+    res$overview
+  })
+  
+  output$probe_plot <- renderPlot({
+    probe_event_plot()
   })
 }
 
