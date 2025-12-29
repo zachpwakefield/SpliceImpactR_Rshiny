@@ -487,9 +487,7 @@ server <- function(input, output, session) {
       rv$di_sig <- if (!is.null(rv$di_norm)) keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr) else NULL
       if (!is.null(rv$di_sig)) {
         matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
-        matched <- unique(as.data.table(matched), by = intersect(c("event_id", "event_type", "gene_id", "transcript_id"), names(matched)))
-        di_delta <- unique(rv$di_norm[, .(event_id, delta_psi)], by = "event_id")
-        rv$matched <- merge(matched, di_delta, by = "event_id", all.x = TRUE)
+        rv$matched <- as.data.table(matched)
       }
       
       incProgress(0.8, detail = "PPI (demo PPIDM)")
@@ -633,9 +631,7 @@ server <- function(input, output, session) {
       rv$di_sig <- keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
       req(rv$di_sig)
       matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
-      matched <- unique(as.data.table(matched), by = intersect(c("event_id", "event_type", "gene_id", "transcript_id"), names(matched)))
-      di_delta <- unique(rv$di_norm[, .(event_id, delta_psi)], by = "event_id")
-      rv$matched <- merge(matched, di_delta, by = "event_id", all.x = TRUE)
+      rv$matched <- as.data.table(matched)
       incProgress(1, detail = "Mapping complete")
     })
   })
