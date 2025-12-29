@@ -239,9 +239,7 @@ ui <- fluidPage(
         ),
         tabPanel(
           "Event probe",
-          helpText("Probe PSI by gene, event type, and event ID drawn from DI results and splicing table."),
-          selectizeInput("probe_gene", "Gene", choices = NULL, options = list(placeholder = "Select gene")),
-          selectInput("probe_event_type", "Event type", choices = c(""), selected = NULL),
+          helpText("Select an event ID from DI results to probe PSI by sample/condition."),
           selectizeInput("probe_event", "Event ID", choices = NULL, options = list(placeholder = "Select event_id")),
           actionButton("run_probe", "Probe event", width = "100%"),
           h4("PSI by sample/condition"),
@@ -672,12 +670,7 @@ server <- function(input, output, session) {
       )
       rv$di <- di
       rv$di_norm <- normalize_di_cols(di)
-      if (!is.null(rv$di_norm)) {
-        di_sig <- keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
-        rv$di_sig <- if (!is.null(di_sig)) unique(as.data.table(di_sig), by = c("event_id", "event_type")) else NULL
-      } else {
-        rv$di_sig <- NULL
-      }
+      rv$di_sig <- if (!is.null(rv$di_norm)) keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr) else NULL
       rv$matched <- NULL
       incProgress(1, detail = "Differential inclusion complete")
     })
@@ -686,8 +679,7 @@ server <- function(input, output, session) {
   observeEvent(input$map_events, {
     req(rv$di_norm, rv$annotations)
     withProgress(message = "Matching events to transcripts", value = 0, {
-      di_sig <- keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
-      rv$di_sig <- if (!is.null(di_sig)) unique(as.data.table(di_sig), by = c("event_id", "event_type")) else NULL
+      rv$di_sig <- keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
       req(rv$di_sig)
       matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
       rv$matched <- as.data.table(matched)
@@ -755,7 +747,7 @@ server <- function(input, output, session) {
   
   output$mapping_summary <- renderTable({
     req(rv$matched)
-    tmp <- unique(as.data.table(rv$matched)[, .(event_id, event_type, gene_id, transcript_id)])
+    tmp <- as.data.table(rv$matched)
     tmp <- apply_filters(tmp, gene_col = "gene_id", tx_col = "transcript_id", gene_override = input$map_gene_filter)
     tmp[, .(
       n_events = uniqueN(event_id),
@@ -861,6 +853,27 @@ server <- function(input, output, session) {
     ))
     output$protein_full <- renderDataTable(dat, options = list(pageLength = 25))
   })
+  
+  compute_proximal_from_mapping <- function() {
+    req(rv$matched, rv$annotations, rv$annotations$sequences)
+    
+    map_dt <- as.data.table(rv$matched)
+    x_seq <- attach_sequences(map_dt, rv$annotations$sequences)
+    
+    # get_pairs() expects delta_psi; if it’s still missing, fail loudly here
+    validate(need("delta_psi" %in% names(x_seq), "delta_psi missing before get_pairs(); merge DI columns by event_id."))
+    
+    pairs <- get_pairs(x_seq, source = "multi")
+    prox_dt <- get_proximal_shift_from_hits(pairs)
+    
+    # validate(need(is.data.frame(prox_dt) && nrow(prox_dt$data) > 0,
+    #               "No proximal/distal results available (AFE/ALE pairs not found after pairing)."))
+    # 
+    list(
+      prox_dt = prox_dt$data,
+      prox_plot = prox_dt$plot
+    )
+  }
   
   output$download_di <- downloadHandler(
     filename = function() paste0("spliceimpactr_di_results_", Sys.Date(), ".csv"),
@@ -1000,24 +1013,19 @@ server <- function(input, output, session) {
     }
     
     run_block <- function(inc_fn) {
-      map_dt_all <- unique(as.data.table(rv$matched), by = c("event_id", "transcript_id"))
-      if (!nrow(map_dt_all)) {
-        showNotification("No mapped events available for downstream analysis.", type = "warning")
-        return(NULL)
-      }
-      map_dt <- copy(map_dt_all)
+      map_dt <- as.data.table(rv$matched)
       if (!is.null(rv$protein_features) && "ensembl_transcript_id" %in% names(rv$protein_features)) {
         keep_tx <- unique(rv$protein_features$ensembl_transcript_id)
         map_dt <- map_dt[transcript_id %in% keep_tx]
       }
       if (!nrow(map_dt)) {
-        showNotification("No mapped events remain after restricting to protein-annotated transcripts for domain/PPI steps.", type = "warning")
+        showNotification("No mapped events available for downstream analysis after filtering to protein-annotated transcripts.", type = "warning")
         return(NULL)
       }
       
       inc_fn(0.2, detail = "Attaching sequences")
       x_seq <- tryCatch(
-        attach_sequences(map_dt_all, rv$annotations$sequences),
+        attach_sequences(map_dt, rv$annotations$sequences),
         error = function(e) {
           showNotification(paste("attach_sequences failed:", e$message), type = "error")
           return(abort_stage("attach_sequences"))
@@ -1180,9 +1188,9 @@ server <- function(input, output, session) {
   })
   
   output$proximal_plot <- renderPlot({
-    res <- downstream_results()
-    if (is.null(res) || is.null(res$proximal_plot)) return(NULL)
-    res$proximal_plot
+    res <- hit_overview()
+    if (is.null(res) || is.null(res$prox) || is.null(res$prox$prox_plot)) return(NULL)
+    res$prox$prox_plot
   })
   
   output$domain_table <- renderTable({
@@ -1213,27 +1221,27 @@ server <- function(input, output, session) {
     filename = function() paste0("spliceimpactr_domain_plot_", Sys.Date(), ".png"),
     content = function(file) {
       res <- downstream_results()
-    if (is.null(res) || is.null(res$domain_plot)) stop("No domain plot available")
-    ggsave(file, plot = res$domain_plot, width = 7, height = 5, dpi = 300)
-  }
-)
-
+      if (is.null(res) || is.null(res$domain_plot)) stop("No domain plot available")
+      ggsave(file, plot = res$domain_plot, width = 7, height = 5, dpi = 300)
+    }
+  )
+  
   integrative_results <- eventReactive(input$run_integrative, {
     dr <- downstream_results()
     if (is.null(dr) || is.null(dr$hits_final) || !nrow(dr$hits_final)) {
       showNotification("Run sequence/domain plots with PPIs loaded to compute hits_final before the integrative summary.", type = "error")
       return(NULL)
-  }
-  di_dt <- normalize_di_cols(rv$di)
-  if (is.null(di_dt)) return(NULL)
-  
-  int <- tryCatch(integrated_event_summary(dr$hits_final, di_dt),
-                  error = function(e) {
-                    showNotification(paste("integrated_event_summary failed:", e$message), type = "error")
-                    NULL
-                  })
-  int
-})
+    }
+    di_dt <- normalize_di_cols(rv$di)
+    if (is.null(di_dt)) return(NULL)
+    
+    int <- tryCatch(integrated_event_summary(dr$hits_final, di_dt),
+                    error = function(e) {
+                      showNotification(paste("integrated_event_summary failed:", e$message), type = "error")
+                      NULL
+                    })
+    int
+  })
   
   output$integrative_plot <- renderPlot({
     res <- integrative_results()
@@ -1243,15 +1251,23 @@ server <- function(input, output, session) {
   
   hit_overview <- eventReactive(input$run_hit_overview + input$run_hit_overview_sidebar, {
     req(rv$sample_frame, rv$splicing)
+    
     hc <- tryCatch(
       compare_hit_index(rv$sample_frame, condition_map = c(control = "control", test = "case")),
-      error = function(e) {showNotification(paste("compare_hit_index failed:", e$message), type = "error"); NULL}
+      error = function(e) { showNotification(paste("compare_hit_index failed:", e$message), type = "error"); NULL }
     )
+    
     ov <- tryCatch(
       overview_splicing_comparison_fixed(rv$splicing, rv$sample_frame, depth_norm = "exon_files", event_type = "AFE"),
-      error = function(e) {showNotification(paste("overview_splicing_comparison_fixed failed:", e$message), type = "error"); NULL}
+      error = function(e) { showNotification(paste("overview_splicing_comparison_fixed failed:", e$message), type = "error"); NULL }
     )
-    list(hit = hc, overview = ov)
+    
+    prox <- tryCatch(
+      compute_proximal_from_mapping(),
+      error = function(e) { showNotification(paste("proximal/distal failed:", e$message), type = "error"); NULL }
+    )
+    
+    list(hit = hc, overview = ov, prox = prox)
   })
   
   output$download_integrative_plot <- downloadHandler(
@@ -1287,46 +1303,22 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "pair_gene", choices = gene_choices, server = TRUE)
     updateSelectizeInput(session, "tx_a", choices = character(0), server = TRUE)
     updateSelectizeInput(session, "tx_b", choices = character(0), server = TRUE)
-    updateSelectizeInput(session, "probe_gene", choices = gene_choices, server = TRUE)
-    updateSelectInput(session, "probe_event_type", choices = c(""))
     updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE)
   }, ignoreNULL = TRUE)
   
-  probe_pool <- reactive({
-    if (is.null(rv$di_norm) || is.null(rv$splicing)) return(data.table())
-    di_dt <- as.data.table(rv$di_norm)[, .(event_id, event_type, gene_id)]
-    sp_dt <- as.data.table(rv$splicing)[, .(event_id, event_type, gene_id)]
-    common_ids <- intersect(di_dt$event_id, sp_dt$event_id)
-    if (!length(common_ids)) return(data.table())
-    merge(di_dt[event_id %chin% common_ids], sp_dt[event_id %chin% common_ids], by = c("event_id", "event_type", "gene_id"))
+  probe_choices <- reactive({
+    di_events <- if (!is.null(rv$di_norm)) unique(rv$di_norm$event_id) else character(0)
+    hit_events <- if (!is.null(rv$splicing)) unique(rv$splicing$event_id) else character(0)
+    choices <- intersect(di_events, hit_events)
+    if (!length(choices) && length(di_events)) choices <- di_events
+    sort(unique(choices))
   })
   
-  observeEvent(probe_pool(), {
-    pool <- probe_pool()
-    genes <- sort(unique(pool$gene_id))
-    current <- isolate(input$probe_gene)
-    selected <- if (!is.null(current) && nzchar(current) && current %chin% genes) current else NULL
-    updateSelectizeInput(session, "probe_gene", choices = genes, server = TRUE, selected = selected)
-    
-    types <- if (!is.null(selected)) sort(unique(pool[gene_id == selected, event_type])) else sort(unique(pool$event_type))
-    updateSelectInput(session, "probe_event_type", choices = types, selected = if (!is.null(input$probe_event_type) && input$probe_event_type %in% types) input$probe_event_type else NULL)
-  }, ignoreInit = TRUE)
-  
-  observeEvent(list(input$probe_gene, input$probe_event_type, probe_pool()), {
-    pool <- probe_pool()
-    if (!nrow(pool)) {
-      updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE)
-      return()
-    }
-    gene_sel <- input$probe_gene
-    type_sel <- input$probe_event_type
-    sub <- pool
-    if (nzchar(gene_sel)) sub <- sub[gene_id == gene_sel]
-    if (nzchar(type_sel)) sub <- sub[event_type == type_sel]
-    events <- sort(unique(sub$event_id))
+  observeEvent(probe_choices(), {
+    choices <- probe_choices()
     current <- isolate(input$probe_event)
-    selected <- if (!is.null(current) && nzchar(current) && current %chin% events) current else NULL
-    updateSelectizeInput(session, "probe_event", choices = events, server = TRUE, selected = selected)
+    selected <- if (!is.null(current) && nzchar(current) && current %chin% choices) current else NULL
+    updateSelectizeInput(session, "probe_event", choices = choices, server = TRUE, selected = selected)
   }, ignoreInit = TRUE)
   
   observeEvent(input$pair_gene, {
@@ -1344,9 +1336,9 @@ server <- function(input, output, session) {
       showNotification("Select an event ID to probe.", type = "warning")
       return(NULL)
     }
-    allowed <- probe_pool()[, event_id]
+    allowed <- intersect(unique(rv$di_norm$event_id), unique(rv$splicing$event_id))
     if (!evt %chin% allowed) {
-      showNotification("Pick an event present in both DI results and the splicing table for the selected gene/type.", type = "warning")
+      showNotification("Pick an event present in both DI results and the splicing table.", type = "warning")
       return(NULL)
     }
     tryCatch(
