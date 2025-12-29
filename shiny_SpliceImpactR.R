@@ -649,8 +649,18 @@ server <- function(input, output, session) {
   
   protein_consequences <- reactive({
     res <- downstream_results()
-    if (is.null(res) || is.null(res$domain_long)) return(data.table())
-    as.data.table(res$domain_long)
+    if (is.null(res) || is.null(res$domain_long)) {
+      return(data.table(
+        event_id = character(), event_type = character(), gene_id = character(),
+        transcript_id = character(), direction = character(), domain_id = character(),
+        database = character(), name = character(), alt_name = character()
+      ))
+    }
+    dt <- as.data.table(res$domain_long)
+    needed <- c("event_id", "event_type", "gene_id", "transcript_id", "direction", "domain_id", "database", "name", "alt_name")
+    missing_cols <- setdiff(needed, names(dt))
+    if (length(missing_cols)) dt[, (missing_cols) := NA_character_]
+    dt[, ..needed]
   })
   
   output$protein_plot <- renderPlot({
@@ -735,10 +745,18 @@ server <- function(input, output, session) {
   
   ppi_results <- reactive({
     res <- downstream_results()
-    if (is.null(res) || is.null(res$hits_final) || !nrow(res$hits_final)) return(data.table())
+    if (is.null(res) || is.null(res$hits_final) || !nrow(res$hits_final)) {
+      return(data.table(
+        event_id = character(), event_type = character(), gene_for_plot = character(),
+        transcript_id_inc = character(), transcript_id_exc = character(),
+        n_inc_ppi = integer(), n_exc_ppi = integer(), n_ppi = integer(),
+        inc_ppi = I(list()), exc_ppi = I(list())
+      ))
+    }
     hf <- as.data.table(res$hits_final)
     hf[, event_type := first_available(hf, c("event_type_inc", "event_type_exc", "event_type"))]
     hf[, gene_for_plot := first_available(hf, c("gene_id", "gene_id_inc", "gene_id_exc"))]
+    if (!"gene_id" %in% names(hf)) hf[, gene_id := gene_for_plot]
     if (nzchar(input$transcript_filter)) {
       hf <- hf[grepl(input$transcript_filter, transcript_id_inc, ignore.case = TRUE) |
                  grepl(input$transcript_filter, transcript_id_exc, ignore.case = TRUE)]
@@ -764,7 +782,10 @@ server <- function(input, output, session) {
   
   output$ppi_summary <- renderTable({
     hf <- ppi_results()
-    if (!nrow(hf)) return(NULL)
+    if (!nrow(hf)) {
+      showNotification("Run sequence/domain plots with PPIs loaded to populate PPI results.", type = "message")
+      return(NULL)
+    }
     hf[, .(
       events = .N,
       impacted = sum(n_ppi > 0, na.rm = TRUE),
@@ -912,15 +933,17 @@ server <- function(input, output, session) {
         feat_lookup <- unique(as.data.table(rv$exon_features)[, .(feature_id, database, name, alt_name, gene_id)])
         domain_long <- merge(domain_long, feat_lookup, by.x = "domain_id", by.y = "feature_id", all.x = TRUE)
         if ("gene_id.x" %in% names(domain_long) && "gene_id.y" %in% names(domain_long)) {
-          domain_long[, gene_id := ifelse(!is.na(gene_id.x), gene_id.x, gene_id.y)]
+          domain_long[, gene_id := fifelse(!is.na(gene_id.x), gene_id.x, gene_id.y)]
           domain_long[, c("gene_id.x", "gene_id.y") := NULL]
         } else if ("gene_id.x" %in% names(domain_long)) {
           setnames(domain_long, "gene_id.x", "gene_id")
         } else if ("gene_id.y" %in% names(domain_long)) {
           setnames(domain_long, "gene_id.y", "gene_id")
         }
-        domain_long[, database := ifelse(is.na(database), "unlabeled", database)]
-        domain_long[, name := ifelse(is.na(name), domain_id, name)]
+        domain_long[, gene_id := fifelse(is.na(gene_id), gene_for_plot, gene_id)]
+        domain_long[, database := ifelse(is.na(database) | database == "", "unlabeled", database)]
+        domain_long[, name := ifelse(is.na(name) | name == "", domain_id, name)]
+        domain_long[, alt_name := ifelse(is.na(alt_name), "", alt_name)]
         domain_summary <- hd[, .(
           events = .N,
           with_domain_change = sum(diff_n > 0, na.rm = TRUE),
@@ -934,6 +957,9 @@ server <- function(input, output, session) {
       if (!is.null(rv$ppidm) && !is.null(hits_domain) && nrow(hits_domain)) {
         restrict_ids <- unique(c(hits_domain$transcript_id_inc, hits_domain$transcript_id_exc))
         restrict_pf <- rv$protein_features[ensembl_transcript_id %in% restrict_ids]
+        if (nrow(restrict_pf) == 0) {
+          showNotification("No protein features matched domain hits; cannot compute PPIs.", type = "warning")
+        }
         ppi_raw <- tryCatch(
           get_isoform_interactions(restrict_pf, rv$ppidm, init = TRUE, save = FALSE),
           error = function(e) {showNotification(paste("get_isoform_interactions failed:", e$message), type = "error"); NULL}
@@ -1016,27 +1042,27 @@ server <- function(input, output, session) {
     filename = function() paste0("spliceimpactr_domain_plot_", Sys.Date(), ".png"),
     content = function(file) {
       res <- downstream_results()
-      if (is.null(res) || is.null(res$domain_plot)) stop("No domain plot available")
-      ggsave(file, plot = res$domain_plot, width = 7, height = 5, dpi = 300)
-    }
-  )
+    if (is.null(res) || is.null(res$domain_plot)) stop("No domain plot available")
+    ggsave(file, plot = res$domain_plot, width = 7, height = 5, dpi = 300)
+  }
+)
+
+integrative_results <- eventReactive(input$run_integrative, {
+  dr <- downstream_results()
+  if (is.null(dr) || is.null(dr$hits_final) || !nrow(dr$hits_final)) {
+    showNotification("Run sequence/domain plots with PPIs loaded to compute hits_final before the integrative summary.", type = "error")
+    return(NULL)
+  }
+  di_dt <- normalize_di_cols(rv$di)
+  if (is.null(di_dt)) return(NULL)
   
-  integrative_results <- eventReactive(input$run_integrative, {
-    dr <- downstream_results()
-    if (is.null(dr) || is.null(dr$hits_final) || !nrow(dr$hits_final)) {
-      showNotification("Run sequence/domain plots with PPIs loaded to compute hits_final before the integrative summary.", type = "error")
-      return(NULL)
-    }
-    di_dt <- normalize_di_cols(rv$di)
-    if (is.null(di_dt)) return(NULL)
-    
-    int <- tryCatch(integrated_event_summary(dr$hits_final, di_dt),
-                    error = function(e) {
-                      showNotification(paste("integrated_event_summary failed:", e$message), type = "error")
-                      NULL
-                    })
-    int
-  })
+  int <- tryCatch(integrated_event_summary(dr$hits_final, di_dt),
+                  error = function(e) {
+                    showNotification(paste("integrated_event_summary failed:", e$message), type = "error")
+                    NULL
+                  })
+  int
+})
   
   output$integrative_plot <- renderPlot({
     res <- integrative_results()
