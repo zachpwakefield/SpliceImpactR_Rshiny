@@ -672,7 +672,12 @@ server <- function(input, output, session) {
       )
       rv$di <- di
       rv$di_norm <- normalize_di_cols(di)
-      rv$di_sig <- if (!is.null(rv$di_norm)) keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr) else NULL
+      if (!is.null(rv$di_norm)) {
+        di_sig <- keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
+        rv$di_sig <- if (!is.null(di_sig)) unique(as.data.table(di_sig), by = c("event_id", "event_type")) else NULL
+      } else {
+        rv$di_sig <- NULL
+      }
       rv$matched <- NULL
       incProgress(1, detail = "Differential inclusion complete")
     })
@@ -681,7 +686,8 @@ server <- function(input, output, session) {
   observeEvent(input$map_events, {
     req(rv$di_norm, rv$annotations)
     withProgress(message = "Matching events to transcripts", value = 0, {
-      rv$di_sig <- keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
+      di_sig <- keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
+      rv$di_sig <- if (!is.null(di_sig)) unique(as.data.table(di_sig), by = c("event_id", "event_type")) else NULL
       req(rv$di_sig)
       matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
       rv$matched <- as.data.table(matched)
