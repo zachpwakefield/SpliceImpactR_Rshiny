@@ -358,6 +358,13 @@ server <- function(input, output, session) {
     if (!length(vals)) return("")
     paste(head(vals, n), collapse = ";")
   }
+  has_df_rows <- function(x) {
+    is.data.frame(x) && nrow(x) > 0
+  }
+  as_dt_or_null <- function(x) {
+    if (is.null(x) || !is.data.frame(x)) return(NULL)
+    as.data.table(x)
+  }
   
   build_domain_long <- function(hits_domain_dt, exon_features_dt) {
     hd <- as.data.table(hits_domain_dt)
@@ -1006,9 +1013,11 @@ server <- function(input, output, session) {
       if (is.null(pairs)) return(NULL)
       
       inc_fn(0.4, detail = "Comparing sequences")
-      seq_compare <- tryCatch(compare_sequence_frame(pairs, rv$annotations$annotations),
-                              error = function(e) {showNotification(paste("compare_sequence_frame failed:", e$message), type = "error"); NULL})
-      if (is.null(seq_compare)) return(NULL)
+      seq_compare <- tryCatch(
+        compare_sequence_frame(pairs, rv$annotations$annotations),
+        error = function(e) {showNotification(paste("compare_sequence_frame failed:", e$message), type = "error"); NULL})
+      seq_compare <- as_dt_or_null(seq_compare)
+      if (!has_df_rows(seq_compare)) return(NULL)
       proximal_output <- tryCatch(get_proximal_shift_from_hits(pairs),
                                   error = function(e) {showNotification(paste("get_proximal_shift_from_hits failed:", e$message), type = "error"); NULL})
       proximal_plot <- if (!is.null(proximal_output) && nrow(proximal_output) > 0) {
@@ -1023,25 +1032,29 @@ server <- function(input, output, session) {
       domain_long <- data.table()
       hits_domain <- NULL
       inc_fn(0.6, detail = "Domain overlaps")
-      hits_domain <- tryCatch(get_domains(seq_compare, rv$exon_features),
-                              error = function(e) {showNotification(paste("get_domains failed:", e$message), type = "error"); NULL})
-      if (!is.null(hits_domain) && nrow(hits_domain) > 0 && !is.null(rv$sample_frame) && !is.null(rv$protein_features)) {
+      hits_domain <- tryCatch(
+        get_domains(seq_compare, rv$exon_features),
+        error = function(e) {showNotification(paste("get_domains failed:", e$message), type = "error"); NULL})
+      hits_domain <- as_dt_or_null(hits_domain)
+      if (has_df_rows(hits_domain) && !is.null(rv$sample_frame) && has_df_rows(rv$protein_features)) {
         bg <- tryCatch(get_background(
           source = "annotated",
           annotations = rv$annotations$annotations,
           protein_features = rv$protein_features
         ), error = function(e) {showNotification(paste("get_background failed:", e$message), type = "error"); NULL})
-        if (!is.null(bg)) {
+        bg <- as_dt_or_null(bg)
+        if (has_df_rows(bg)) {
           enriched_domains <- tryCatch(enrich_domains_hypergeo(hits_domain, bg, db_filter = "interpro"),
                                        error = function(e) NULL)
-          if (!is.null(enriched_domains) && nrow(enriched_domains) > 0) {
+          enriched_domains <- as_dt_or_null(enriched_domains)
+          if (has_df_rows(enriched_domains)) {
             domain_plot <- tryCatch(plot_enriched_domains_counts(enriched_domains, top_n = 20),
                                     error = function(e) NULL)
           }
         }
       }
       
-      if (!is.null(hits_domain)) {
+      if (has_df_rows(hits_domain)) {
         hd <- as.data.table(hits_domain)
         hd[, event_type := first_available(hd, c("event_type_inc", "event_type_exc", "event_type"))]
         hd[, gene_for_plot := first_available(hd, c("gene_id", "gene_id_inc", "gene_id_exc"))]
@@ -1055,33 +1068,35 @@ server <- function(input, output, session) {
         )
         domain_summary <- hd[, .(
           events = .N,
-          with_domain_change = sum(diff_n > 0, na.rm = TRUE),
-          inc_only = sum(inc_only_n, na.rm = TRUE),
-          exc_only = sum(exc_only_n, na.rm = TRUE)
+          with_domain_change = sum(as.numeric(diff_n) > 0, na.rm = TRUE),
+          inc_only = sum(as.numeric(inc_only_n), na.rm = TRUE),
+          exc_only = sum(as.numeric(exc_only_n), na.rm = TRUE)
         ), by = event_type][order(-with_domain_change)]
       }
       
       hits_final <- NULL
       ppi_plot <- NULL
-      if (!is.null(rv$ppidm) && !is.null(hits_domain) && nrow(hits_domain) > 0) {
+      if (!is.null(rv$ppidm) && has_df_rows(hits_domain)) {
         restrict_ids <- unique(c(hits_domain$transcript_id_inc, hits_domain$transcript_id_exc))
-        restrict_pf <- rv$protein_features[ensembl_transcript_id %in% restrict_ids]
-        if (nrow(restrict_pf) == 0) {
+        restrict_pf <- as.data.table(rv$protein_features)[ensembl_transcript_id %in% restrict_ids]
+        if (!nrow(restrict_pf)) {
           showNotification("No protein features matched domain hits; cannot compute PPIs.", type = "warning")
-        }
-        ppi_raw <- tryCatch(
-          get_isoform_interactions(restrict_pf, rv$ppidm, init = TRUE, save = FALSE),
-          error = function(e) {showNotification(paste("get_isoform_interactions failed:", e$message), type = "error"); NULL}
-        )
-        ppi_std <- if (!is.null(ppi_raw)) standardize_ppi_cols(ppi_raw) else NULL
-        if (!is.null(ppi_std)) {
-          hits_final <- tryCatch(get_ppi_switches(hits_domain, ppi_std),
-                                 error = function(e) {
-                                   showNotification(paste("get_ppi_switches failed:", e$message), type = "error")
-                                   NULL
-                                 })
-          if (!is.null(hits_final) && nrow(hits_final) > 0) {
-            ppi_plot <- tryCatch(plot_ppi_summary(hits_final), error = function(e) NULL)
+        } else {
+          ppi_raw <- tryCatch(
+            get_isoform_interactions(restrict_pf, rv$ppidm, init = TRUE, save = FALSE),
+            error = function(e) {showNotification(paste("get_isoform_interactions failed:", e$message), type = "error"); NULL}
+          )
+          ppi_std <- if (!is.null(ppi_raw)) standardize_ppi_cols(ppi_raw) else NULL
+          if (!is.null(ppi_std) && nrow(ppi_std) > 0) {
+            hits_final <- tryCatch(get_ppi_switches(hits_domain, ppi_std),
+                                   error = function(e) {
+                                     showNotification(paste("get_ppi_switches failed:", e$message), type = "error")
+                                     NULL
+                                   })
+            hits_final <- as_dt_or_null(hits_final)
+            if (has_df_rows(hits_final)) {
+              ppi_plot <- tryCatch(plot_ppi_summary(hits_final), error = function(e) NULL)
+            }
           }
         }
       } else if (is.null(rv$ppidm)) {
@@ -1254,17 +1269,23 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "pair_gene", choices = gene_choices, server = TRUE)
     updateSelectizeInput(session, "tx_a", choices = character(0), server = TRUE)
     updateSelectizeInput(session, "tx_b", choices = character(0), server = TRUE)
-    updateSelectizeInput(session, "probe_event", choices = if (!is.null(rv$di_norm)) unique(rv$di_norm$event_id) else NULL, server = TRUE)
+    updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE)
   }, ignoreNULL = TRUE)
   
-  observe({
+  probe_choices <- reactive({
     di_events <- if (!is.null(rv$di_norm)) unique(rv$di_norm$event_id) else character(0)
     hit_events <- if (!is.null(rv$splicing)) unique(rv$splicing$event_id) else character(0)
     choices <- intersect(di_events, hit_events)
     if (!length(choices) && length(di_events)) choices <- di_events
-    selected_evt <- if (!is.null(input$probe_event) && nzchar(input$probe_event) && input$probe_event %in% choices) input$probe_event else NULL
-    updateSelectizeInput(session, "probe_event", choices = choices, server = TRUE, selected = selected_evt)
+    sort(unique(choices))
   })
+  
+  observeEvent(probe_choices(), {
+    choices <- probe_choices()
+    current <- isolate(input$probe_event)
+    selected <- if (!is.null(current) && nzchar(current) && current %chin% choices) current else NULL
+    updateSelectizeInput(session, "probe_event", choices = choices, server = TRUE, selected = selected)
+  }, ignoreInit = TRUE)
   
   observeEvent(input$pair_gene, {
     req(rv$annotations)
@@ -1283,7 +1304,7 @@ server <- function(input, output, session) {
     }
     allowed <- intersect(unique(rv$di_norm$event_id), unique(rv$splicing$event_id))
     if (!evt %chin% allowed) {
-      showNotification("Pick an event present in the differential inclusion results.", type = "warning")
+      showNotification("Pick an event present in both DI results and the splicing table.", type = "warning")
       return(NULL)
     }
     tryCatch(
