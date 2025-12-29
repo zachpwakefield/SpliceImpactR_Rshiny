@@ -334,73 +334,57 @@ server <- function(input, output, session) {
   build_domain_long <- function(hits_domain_dt, exon_features_dt) {
     hd <- as.data.table(hits_domain_dt)
     
-    hd[, event_type := first_available(hd, c("event_type_inc", "event_type_exc", "event_type"))]
+    hd[, event_type   := first_available(hd, c("event_type_inc", "event_type_exc", "event_type"))]
     hd[, gene_id_plot := first_available(hd, c("gene_id", "gene_id_inc", "gene_id_exc"))]
     
-    for (col in c("inc_only_domains_list", "exc_only_domains_list", "either_domains_list")) {
-      if (!col %in% names(hd)) hd[, (col) := list(list())]
+    for (c in c("event_id", "transcript_id_inc", "transcript_id_exc")) {
+      if (!c %in% names(hd)) hd[, (c) := NA_character_]
+    }
+    for (lc in c("inc_only_domains_list", "exc_only_domains_list", "either_domains_list")) {
+      if (!lc %in% names(hd)) hd[, (lc) := vector("list", nrow(hd))]
     }
     
-    inc_long <- hd[, {
-      v <- inc_only_domains_list[[1]]
-      if (!length(v)) return(NULL)
-      data.table(
-        event_id = event_id,
-        event_type = event_type,
+    expand_dir <- function(list_col, tx_col, direction_label) {
+      out <- hd[, .(
+        event_id,
+        event_type,
         gene_id = gene_id_plot,
-        transcript_id = transcript_id_inc,
-        direction = "inclusion",
-        domain_id = as.character(v)
-      )
-    }, by = .I]
+        transcript_id = get(tx_col),
+        domain_vec = get(list_col)
+      )]
+      
+      out <- out[!vapply(domain_vec, is.null, logical(1))]
+      out <- out[, .(
+        domain_id = as.character(unlist(domain_vec, use.names = FALSE))
+      ), by = .(event_id, event_type, gene_id, transcript_id)]
+      
+      out <- out[!is.na(domain_id) & nzchar(domain_id)]
+      out[, direction := direction_label]
+      out[]
+    }
     
-    exc_long <- hd[, {
-      v <- exc_only_domains_list[[1]]
-      if (!length(v)) return(NULL)
-      data.table(
-        event_id = event_id,
-        event_type = event_type,
-        gene_id = gene_id_plot,
-        transcript_id = transcript_id_exc,
-        direction = "exclusion",
-        domain_id = as.character(v)
-      )
-    }, by = .I]
+    inc_long    <- expand_dir("inc_only_domains_list", "transcript_id_inc", "inclusion")
+    exc_long    <- expand_dir("exc_only_domains_list", "transcript_id_exc", "exclusion")
+    shared_long <- expand_dir("either_domains_list",   "transcript_id_inc", "shared")
     
-    shared_long <- hd[, {
-      v <- either_domains_list[[1]]
-      if (!length(v)) return(NULL)
-      data.table(
-        event_id = event_id,
-        event_type = event_type,
-        gene_id = gene_id_plot,
-        transcript_id = transcript_id_inc,
-        direction = "shared",
-        domain_id = as.character(v)
-      )
-    }, by = .I]
-    
-    dom <- data.table::rbindlist(list(inc_long, exc_long, shared_long), use.names = TRUE, fill = TRUE)
-    dom[, .I := NULL]
+    dom <- rbindlist(list(inc_long, exc_long, shared_long), use.names = TRUE, fill = TRUE)
     if (!nrow(dom)) return(dom)
     
-    dom <- dom[!is.na(domain_id) & nzchar(domain_id)]
-    
     ef <- as.data.table(exon_features_dt)
-    ef[, dom_key := sprintf("%s;%s", as.character(database), as.character(name))]
-    feat_lookup <- unique(ef[, .(dom_key, database, name, alt_name)])
+    feat_lookup <- unique(ef[, .(feature_id, database, name, alt_name)])
+    dom <- merge(dom, feat_lookup, by.x = "domain_id", by.y = "feature_id", all.x = TRUE)
     
-    dom <- merge(dom, feat_lookup, by.x = "domain_id", by.y = "dom_key", all.x = TRUE)
-    
-    missing_lab <- is.na(dom$database) | !nzchar(dom$database) | is.na(dom$name) | !nzchar(dom$name)
-    if (any(missing_lab)) {
-      parsed <- tstrsplit(dom$domain_id[missing_lab], ";", fixed = TRUE, keep = 1:2)
-      dom[missing_lab & (is.na(database) | !nzchar(database)), database := parsed[[1]]]
-      dom[missing_lab & (is.na(name) | !nzchar(name)), name := parsed[[2]]]
+    miss <- is.na(dom$database) | !nzchar(dom$database) | is.na(dom$name) | !nzchar(dom$name)
+    if (any(miss)) {
+      parsed <- tstrsplit(dom$domain_id[miss], ";", fixed = TRUE)
+      if (length(parsed) >= 2) {
+        dom[miss & (is.na(database) | !nzchar(database)), database := parsed[[1]]]
+        dom[miss & (is.na(name) | !nzchar(name)), name := parsed[[2]]]
+      }
     }
     
     dom[, database := fifelse(is.na(database) | !nzchar(database), "unlabeled", database)]
-    dom[, name := fifelse(is.na(name) | !nzchar(name), domain_id, name)]
+    dom[, name     := fifelse(is.na(name)     | !nzchar(name),     domain_id,   name)]
     dom[, alt_name := fifelse(is.na(alt_name), "", alt_name)]
     dom[]
   }
@@ -503,7 +487,7 @@ server <- function(input, output, session) {
       rv$di_sig <- if (!is.null(rv$di_norm)) keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr) else NULL
       if (!is.null(rv$di_sig)) {
         matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
-        rv$matched <- merge(matched, rv$di_norm[, .(event_id, delta_psi)], by = "event_id", all.x = TRUE)
+        rv$matched <- as.data.table(matched)
       }
       
       incProgress(0.8, detail = "PPI (demo PPIDM)")
@@ -647,7 +631,7 @@ server <- function(input, output, session) {
       rv$di_sig <- keep_sig_pairs(rv$di_norm, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
       req(rv$di_sig)
       matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
-      rv$matched <- merge(matched, rv$di_norm[, .(event_id, delta_psi)], by = "event_id", all.x = TRUE)
+      rv$matched <- as.data.table(matched)
       incProgress(1, detail = "Mapping complete")
     })
   })
@@ -711,10 +695,13 @@ server <- function(input, output, session) {
   
   output$mapping_summary <- renderTable({
     req(rv$matched)
-    keep <- c("event_type", "gene_id", "transcript_id")
-    tmp <- rv$matched[, ..keep]
+    tmp <- unique(as.data.table(rv$matched)[, .(event_id, event_type, gene_id, transcript_id)])
     tmp <- apply_filters(tmp, gene_col = "gene_id", tx_col = "transcript_id", gene_override = input$map_gene_filter)
-    tmp[, .(n_events = .N, n_transcripts = uniqueN(transcript_id)), by = event_type][order(-n_events)]
+    tmp[, .(
+      n_events = uniqueN(event_id),
+      n_transcripts = uniqueN(transcript_id),
+      n_event_tx_pairs = .N
+    ), by = event_type][order(-n_events)]
   })
   
   output$mapping_gene_table <- renderTable({
@@ -953,6 +940,10 @@ server <- function(input, output, session) {
     }
     withProgress(message = "Running sequence/domain plots", value = 0, {
       map_dt <- unique(as.data.table(rv$matched), by = c("event_id", "transcript_id"))
+      if (!is.null(rv$protein_features) && "ensembl_transcript_id" %in% names(rv$protein_features)) {
+        keep_tx <- unique(rv$protein_features$ensembl_transcript_id)
+        map_dt <- map_dt[transcript_id %in% keep_tx]
+      }
       if (!is.null(rv$di_norm) && "event_id" %in% names(rv$di_norm) && !"delta_psi" %in% names(map_dt)) {
         map_dt <- merge(map_dt, rv$di_norm[, .(event_id, delta_psi)], by = "event_id", all.x = TRUE)
       }
