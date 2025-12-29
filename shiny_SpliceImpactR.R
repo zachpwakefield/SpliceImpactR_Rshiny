@@ -657,23 +657,21 @@ server <- function(input, output, session) {
   protein_consequences <- reactive({
     res <- downstream_results()
     if (is.null(res) || is.null(res$domain_long)) {
-      return(data.table(
-        event_id = character(), event_type = character(), gene_id = character(),
-        transcript_id = character(), direction = character(), domain_id = character(),
-        database = character(), name = character(), alt_name = character()
-      ))
+      showNotification("Run sequence/domain plots after loading proteins to view domain changes.", type = "message")
+      return(data.table())
     }
     dt <- as.data.table(res$domain_long)
     needed <- c("event_id", "event_type", "gene_id", "transcript_id", "direction", "domain_id", "database", "name", "alt_name")
     missing_cols <- setdiff(needed, names(dt))
     if (length(missing_cols)) dt[, (missing_cols) := NA_character_]
-    dt[, ..needed]
+    out <- dt[, ..needed]
+    for (col in needed) set(out, j = col, value = as.character(out[[col]]))
+    as.data.table(out)
   })
   
   output$protein_plot <- renderPlot({
     cons <- protein_consequences()
     if (!nrow(cons)) {
-      showNotification("Run sequence/domain plots to compute domain changes.", type = "message")
       return(NULL)
     }
     cons <- apply_filters(cons, gene_col = "gene_id", tx_col = "transcript_id", prot_col = "ensembl_peptide_id", gene_override = input$prot_gene_filter)
@@ -853,7 +851,7 @@ server <- function(input, output, session) {
   )
   
   downstream_results <- eventReactive(input$run_downstream, {
-    req(rv$matched, rv$annotations, rv$exon_features)
+    req(rv$matched, rv$annotations, rv$exon_features, rv$protein_features)
     if (is.null(rv$annotations$sequences)) {
       showNotification("Annotation sequences are required for downstream plots.", type = "error")
       return(NULL)
