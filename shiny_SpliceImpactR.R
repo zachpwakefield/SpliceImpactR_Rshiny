@@ -98,7 +98,11 @@ ui <- fluidPage(
       hr(),
       h4("Annotation mapping"),
       helpText("Match events to the loaded annotation to highlight likely transcripts."),
-      actionButton("map_events", "Map events to transcripts", width = "100%")
+      actionButton("map_events", "Map events to transcripts", width = "100%"),
+      hr(),
+      h4("Sequence/domain + PPI"),
+      helpText("Run after mapping and loading proteins/PPIs to populate Protein consequences, PPI, and Integrative tabs."),
+      actionButton("run_downstream", "Run sequence/domain + PPI summary", width = "100%")
     ),
     mainPanel(
       width = 8,
@@ -126,7 +130,7 @@ ui <- fluidPage(
             tags$li("Load splicing inputs (toggle demo or upload manifest)."),
             tags$li("Load protein features, then load PPIs (needed for domain + PPI tabs)."),
             tags$li("Run differential inclusion, then map events to transcripts."),
-            tags$li("Click ", strong("Run sequence/domain plots"), " to compute sequence alignments, domain hits, and PPI switches."),
+            tags$li("Click the sidebar button ", strong("Run sequence/domain + PPI summary"), " to compute sequence alignments, domain hits, and PPI switches; all downstream tabs will populate after this."),
             tags$li("Explore Protein consequences, PPI, Seq/Domain plots, and Integrative summary tabs."),
             tags$li("Use Downloads to export DI, mapping, and consequence tables.")
           ),
@@ -205,7 +209,7 @@ ui <- fluidPage(
         ),
         tabPanel(
           "Seq/Domain plots",
-          actionButton("run_downstream", "Run sequence/domain plots", width = "100%"),
+          helpText("Use the sidebar button to run sequence/domain + PPI summary, then view plots below."),
           h4("Alignment summary"),
           plotOutput("alignment_plot", height = 350),
           downloadButton("download_alignment_plot", "Download alignment plot"),

@@ -151,6 +151,9 @@ res_di <- keep_sig_pairs(res)
 volcano_plot <- plot_di_volcano_dt(res)
 ```
 
+## Running the downstream (domains + PPI) pipeline in the Shiny app
+After mapping events, load protein features/PPIs and click the **“Run sequence/domain + PPI summary”** button in the sidebar. That triggers sequence alignment, domain overlap, and PPI-switch calls; the Protein consequences, PPI, Seq/Domain plots, and Integrative tabs then show results without needing an extra button inside those tabs.
+
 ```r
 ## We can also load user-supplied data from any source through: get_user_data and get_user_data_post_di. Here we use minimal example data frames
 # pre-di
@@ -367,4 +370,3 @@ SpliceImpactR maps alternative RNA processing events driving protein functional 
 https://www.biorxiv.org/content/10.1101/2025.06.20.660706v1
 https://github.com/fiszbein-lab/SpliceImpactR
 ```
-
