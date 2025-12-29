@@ -860,13 +860,8 @@ server <- function(input, output, session) {
     }
     withProgress(message = "Running sequence/domain plots", value = 0, {
       map_dt <- unique(as.data.table(rv$matched), by = c("event_id", "transcript_id"))
-      di_dt <- normalize_di_cols(rv$di)
-      if (!is.null(di_dt) && "event_id" %in% names(di_dt)) {
-        map_dt <- merge(map_dt, di_dt[, .(event_id, delta_psi)], by = "event_id", all.x = TRUE)
-      }
-      if (!"delta_psi" %in% names(map_dt) || all(is.na(map_dt$delta_psi))) {
-        showNotification("Downstream plots require delta_psi on mapped events; run DI first or supply a table with delta_psi.", type = "error")
-        return(NULL)
+      if (!is.null(rv$di_norm) && "event_id" %in% names(rv$di_norm) && !"delta_psi" %in% names(map_dt)) {
+        map_dt <- merge(map_dt, rv$di_norm[, .(event_id, delta_psi)], by = "event_id", all.x = TRUE)
       }
       
       incProgress(0.2, detail = "Attaching sequences")
@@ -935,7 +930,15 @@ server <- function(input, output, session) {
           direction = "exclusion",
           domain_id = unlist(exc_only_domains_list)
         )]
-        domain_long <- data.table::rbindlist(list(inc_long, exc_long), use.names = TRUE, fill = TRUE)
+        shared_long <- hd[, .(
+          event_id,
+          event_type,
+          gene_id = gene_for_plot,
+          transcript_id = transcript_id_inc,
+          direction = "shared",
+          domain_id = unlist(either_domains_list)
+        )]
+        domain_long <- data.table::rbindlist(list(inc_long, exc_long, shared_long), use.names = TRUE, fill = TRUE)
         domain_long <- domain_long[nzchar(domain_id)]
         feat_lookup <- unique(as.data.table(rv$exon_features)[, .(feature_id, database, name, alt_name, gene_id)])
         domain_long <- merge(domain_long, feat_lookup, by.x = "domain_id", by.y = "feature_id", all.x = TRUE)
