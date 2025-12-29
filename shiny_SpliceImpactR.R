@@ -293,6 +293,7 @@ server <- function(input, output, session) {
     exon_features = NULL,
     ppidm = NULL
   )
+  downstream_results <- reactiveVal(NULL)
   
   output$di_colnames <- renderPrint({
     if (is.null(rv$di)) return("DI results not loaded yet.")
@@ -465,6 +466,7 @@ server <- function(input, output, session) {
   
   observeEvent(input$load_demo_all, {
     withProgress(message = "Loading bundled demo pipeline", value = 0, {
+      downstream_results(NULL)
       incProgress(0.1, detail = "Annotations")
       ann <- get_annotation(load = "test")
       rv$annotations <- ann
@@ -520,8 +522,14 @@ server <- function(input, output, session) {
       incProgress(0.8, detail = "PPI (demo PPIDM)")
       rv$ppidm <- get_ppidm(test = TRUE)
       
-      # trigger downstream run for demo
-      updateActionButton(session, "run_downstream", value = isolate(input$run_downstream) + 1)
+      res <- tryCatch(
+        compute_downstream(show_progress = FALSE),
+        error = function(e) {
+          showNotification(paste("Downstream results error:", e$message), type = "error")
+          NULL
+        }
+      )
+      downstream_results(res)
       
       incProgress(1, detail = "Demo ready")
     })
@@ -560,6 +568,7 @@ server <- function(input, output, session) {
       rv$protein_features <- NULL
       rv$exon_features <- NULL
       rv$ppidm <- NULL
+      downstream_results(NULL)
       incProgress(1, detail = "Events loaded")
     })
   })
@@ -615,6 +624,7 @@ server <- function(input, output, session) {
       }
       rv$exon_features <- ef
       rv$ppidm <- NULL
+      downstream_results(NULL)
       incProgress(1, detail = "Protein features ready")
     })
   })
@@ -760,9 +770,6 @@ server <- function(input, output, session) {
   })
   
   protein_consequences <- reactive({
-    if (is.null(input$run_downstream) || input$run_downstream == 0) {
-      return(data.table())
-    }
     res <- tryCatch(
       downstream_results(),
       error = function(e) {
@@ -963,23 +970,28 @@ server <- function(input, output, session) {
     }
   )
   
-  downstream_results <- eventReactive(input$run_downstream, {
-    req(rv$matched, rv$annotations, rv$exon_features, rv$protein_features)
+  compute_downstream <- function(show_progress = TRUE) {
+    if (is.null(rv$matched) || is.null(rv$annotations) || is.null(rv$exon_features) || is.null(rv$protein_features)) {
+      showNotification("Load annotations, proteins, and mapped events before running downstream analyses.", type = "warning")
+      return(NULL)
+    }
     if (is.null(rv$annotations$sequences)) {
       showNotification("Annotation sequences are required for downstream plots.", type = "error")
       return(NULL)
     }
-    withProgress(message = "Running sequence/domain plots", value = 0, {
+    
+    run_block <- function(inc_fn) {
       map_dt <- unique(as.data.table(rv$matched), by = c("event_id", "transcript_id"))
       if (!is.null(rv$protein_features) && "ensembl_transcript_id" %in% names(rv$protein_features)) {
         keep_tx <- unique(rv$protein_features$ensembl_transcript_id)
         map_dt <- map_dt[transcript_id %in% keep_tx]
       }
-      if (!is.null(rv$di_norm) && "event_id" %in% names(rv$di_norm) && !"delta_psi" %in% names(map_dt)) {
-        map_dt <- merge(map_dt, rv$di_norm[, .(event_id, delta_psi)], by = "event_id", all.x = TRUE)
+      if (!nrow(map_dt)) {
+        showNotification("No mapped events available for downstream analysis after filtering to protein-annotated transcripts.", type = "warning")
+        return(NULL)
       }
       
-      incProgress(0.2, detail = "Attaching sequences")
+      inc_fn(0.2, detail = "Attaching sequences")
       x_seq <- tryCatch(
         attach_sequences(map_dt, rv$annotations$sequences),
         error = function(e) {
@@ -993,13 +1005,13 @@ server <- function(input, output, session) {
       })
       if (is.null(pairs)) return(NULL)
       
-      incProgress(0.4, detail = "Comparing sequences")
+      inc_fn(0.4, detail = "Comparing sequences")
       seq_compare <- tryCatch(compare_sequence_frame(pairs, rv$annotations$annotations),
-                              error = function(e) {showNotification(paste("compare_sequence_frame failed:", e$message), type="error"); NULL})
+                              error = function(e) {showNotification(paste("compare_sequence_frame failed:", e$message), type = "error"); NULL})
       if (is.null(seq_compare)) return(NULL)
       proximal_output <- tryCatch(get_proximal_shift_from_hits(pairs),
                                   error = function(e) {showNotification(paste("get_proximal_shift_from_hits failed:", e$message), type = "error"); NULL})
-      proximal_plot <- if (!is.null(proximal_output) && nrow(proximal_output)) {
+      proximal_plot <- if (!is.null(proximal_output) && nrow(proximal_output) > 0) {
         tryCatch(plot_prox_dist(proximal_output), error = function(e) NULL)
       } else NULL
       alignment_plot <- tryCatch(plot_alignment_summary(seq_compare), error = function(e) NULL)
@@ -1010,19 +1022,19 @@ server <- function(input, output, session) {
       domain_summary <- NULL
       domain_long <- data.table()
       hits_domain <- NULL
-      incProgress(0.6, detail = "Domain overlaps")
+      inc_fn(0.6, detail = "Domain overlaps")
       hits_domain <- tryCatch(get_domains(seq_compare, rv$exon_features),
-                              error = function(e) {showNotification(paste("get_domains failed:", e$message), type="error"); NULL})
-      if (!is.null(hits_domain) && !is.null(rv$sample_frame) && !is.null(rv$protein_features)) {
+                              error = function(e) {showNotification(paste("get_domains failed:", e$message), type = "error"); NULL})
+      if (!is.null(hits_domain) && nrow(hits_domain) > 0 && !is.null(rv$sample_frame) && !is.null(rv$protein_features)) {
         bg <- tryCatch(get_background(
           source = "annotated",
           annotations = rv$annotations$annotations,
           protein_features = rv$protein_features
-        ), error = function(e) {showNotification(paste("get_background failed:", e$message), type="error"); NULL})
+        ), error = function(e) {showNotification(paste("get_background failed:", e$message), type = "error"); NULL})
         if (!is.null(bg)) {
           enriched_domains <- tryCatch(enrich_domains_hypergeo(hits_domain, bg, db_filter = "interpro"),
                                        error = function(e) NULL)
-          if (!is.null(enriched_domains) && nrow(enriched_domains)) {
+          if (!is.null(enriched_domains) && nrow(enriched_domains) > 0) {
             domain_plot <- tryCatch(plot_enriched_domains_counts(enriched_domains, top_n = 20),
                                     error = function(e) NULL)
           }
@@ -1034,30 +1046,6 @@ server <- function(input, output, session) {
         hd[, event_type := first_available(hd, c("event_type_inc", "event_type_exc", "event_type"))]
         hd[, gene_for_plot := first_available(hd, c("gene_id", "gene_id_inc", "gene_id_exc"))]
         
-        inc_long <- hd[, .(
-          event_id,
-          event_type,
-          gene_id = gene_for_plot,
-          transcript_id = transcript_id_inc,
-          direction = "inclusion",
-          domain_id = unlist(inc_only_domains_list)
-        )]
-        exc_long <- hd[, .(
-          event_id,
-          event_type,
-          gene_id = gene_for_plot,
-          transcript_id = transcript_id_exc,
-          direction = "exclusion",
-          domain_id = unlist(exc_only_domains_list)
-        )]
-        shared_long <- hd[, .(
-          event_id,
-          event_type,
-          gene_id = gene_for_plot,
-          transcript_id = transcript_id_inc,
-          direction = "shared",
-          domain_id = unlist(either_domains_list)
-        )]
         domain_long <- tryCatch(
           build_domain_long(hd, rv$exon_features),
           error = function(e) {
@@ -1075,7 +1063,7 @@ server <- function(input, output, session) {
       
       hits_final <- NULL
       ppi_plot <- NULL
-      if (!is.null(rv$ppidm) && !is.null(hits_domain) && nrow(hits_domain)) {
+      if (!is.null(rv$ppidm) && !is.null(hits_domain) && nrow(hits_domain) > 0) {
         restrict_ids <- unique(c(hits_domain$transcript_id_inc, hits_domain$transcript_id_exc))
         restrict_pf <- rv$protein_features[ensembl_transcript_id %in% restrict_ids]
         if (nrow(restrict_pf) == 0) {
@@ -1092,7 +1080,7 @@ server <- function(input, output, session) {
                                    showNotification(paste("get_ppi_switches failed:", e$message), type = "error")
                                    NULL
                                  })
-          if (!is.null(hits_final) && nrow(hits_final)) {
+          if (!is.null(hits_final) && nrow(hits_final) > 0) {
             ppi_plot <- tryCatch(plot_ppi_summary(hits_final), error = function(e) NULL)
           }
         }
@@ -1100,7 +1088,7 @@ server <- function(input, output, session) {
         showNotification("Load PPI interactions to compute PPI switches alongside domain hits.", type = "message")
       }
       
-      incProgress(1, detail = "Done")
+      inc_fn(1, detail = "Done")
       
       list(
         seq_compare = seq_compare,
@@ -1117,7 +1105,27 @@ server <- function(input, output, session) {
         proximal_output = proximal_output,
         proximal_plot = proximal_plot
       )
-    })
+    }
+    
+    if (isTRUE(show_progress)) {
+      withProgress(message = "Running sequence/domain plots", value = 0, {
+        run_block(incProgress)
+      })
+    } else {
+      inc_stub <- function(amount = 0, detail = NULL) {}
+      run_block(inc_stub)
+    }
+  }
+  
+  observeEvent(input$run_downstream, {
+    res <- tryCatch(
+      compute_downstream(show_progress = TRUE),
+      error = function(e) {
+        showNotification(paste("Downstream results error:", e$message), type = "error")
+        NULL
+      }
+    )
+    downstream_results(res)
   })
   
   output$alignment_plot <- renderPlot({
@@ -1249,6 +1257,15 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "probe_event", choices = if (!is.null(rv$di_norm)) unique(rv$di_norm$event_id) else NULL, server = TRUE)
   }, ignoreNULL = TRUE)
   
+  observe({
+    di_events <- if (!is.null(rv$di_norm)) unique(rv$di_norm$event_id) else character(0)
+    hit_events <- if (!is.null(rv$splicing)) unique(rv$splicing$event_id) else character(0)
+    choices <- intersect(di_events, hit_events)
+    if (!length(choices) && length(di_events)) choices <- di_events
+    selected_evt <- if (!is.null(input$probe_event) && nzchar(input$probe_event) && input$probe_event %in% choices) input$probe_event else NULL
+    updateSelectizeInput(session, "probe_event", choices = choices, server = TRUE, selected = selected_evt)
+  })
+  
   observeEvent(input$pair_gene, {
     req(rv$annotations)
     ann <- as.data.table(rv$annotations$annotations)
@@ -1258,14 +1275,19 @@ server <- function(input, output, session) {
   }, ignoreInit = TRUE)
   
   probe_event_plot <- eventReactive(input$run_probe, {
-    req(rv$di_norm)
+    req(rv$di_norm, rv$splicing)
     evt <- input$probe_event
     if (!nzchar(evt)) {
       showNotification("Select an event ID to probe.", type = "warning")
       return(NULL)
     }
+    allowed <- intersect(unique(rv$di_norm$event_id), unique(rv$splicing$event_id))
+    if (!evt %chin% allowed) {
+      showNotification("Pick an event present in the differential inclusion results.", type = "warning")
+      return(NULL)
+    }
     tryCatch(
-      probe_individual_event(rv$di_norm, event = evt),
+      probe_individual_event(rv$splicing, event = evt),
       error = function(e) {
         showNotification(paste("probe_individual_event failed:", e$message), type = "error")
         NULL
