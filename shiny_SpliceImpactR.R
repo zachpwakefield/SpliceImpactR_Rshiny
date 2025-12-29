@@ -1254,6 +1254,7 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "pair_gene", choices = gene_choices, server = TRUE)
     updateSelectizeInput(session, "tx_a", choices = character(0), server = TRUE)
     updateSelectizeInput(session, "tx_b", choices = character(0), server = TRUE)
+    updateSelectizeInput(session, "probe_event", choices = if (!is.null(rv$di_norm)) unique(rv$di_norm$event_id) else NULL, server = TRUE)
   }, ignoreNULL = TRUE)
   
   observe({
