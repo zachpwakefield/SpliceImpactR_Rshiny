@@ -280,9 +280,14 @@ server <- function(input, output, session) {
     }
     active_gene_filter <- if (is.null(gene_override) || !nzchar(gene_override)) input$gene_filter else gene_override
     if (!is.null(gene_col) && nzchar(active_gene_filter)) {
-      filt <- grepl(active_gene_filter, out[[gene_col]], ignore.case = TRUE) |
-        ("gene_name" %in% names(out) && grepl(active_gene_filter, out$gene_name, ignore.case = TRUE))
-      out <- out[filt]
+      f1 <- grepl(active_gene_filter, out[[gene_col]], ignore.case = TRUE)
+      f1[is.na(f1)] <- FALSE
+      if ("gene_name" %in% names(out)) {
+        f2 <- grepl(active_gene_filter, out$gene_name, ignore.case = TRUE)
+        f2[is.na(f2)] <- FALSE
+        f1 <- f1 | f2
+      }
+      out <- out[f1]
     }
     if (!is.null(tx_col) && nzchar(input$transcript_filter) && tx_col %in% names(out)) {
       out <- out[grepl(input$transcript_filter, out[[tx_col]], ignore.case = TRUE)]
@@ -324,6 +329,80 @@ server <- function(input, output, session) {
     vals <- vals[nzchar(vals) & !is.na(vals)]
     if (!length(vals)) return("")
     paste(head(vals, n), collapse = ";")
+  }
+  
+  build_domain_long <- function(hits_domain_dt, exon_features_dt) {
+    hd <- as.data.table(hits_domain_dt)
+    
+    hd[, event_type := first_available(hd, c("event_type_inc", "event_type_exc", "event_type"))]
+    hd[, gene_id_plot := first_available(hd, c("gene_id", "gene_id_inc", "gene_id_exc"))]
+    
+    for (col in c("inc_only_domains_list", "exc_only_domains_list", "either_domains_list")) {
+      if (!col %in% names(hd)) hd[, (col) := list(list())]
+    }
+    
+    inc_long <- hd[, {
+      v <- inc_only_domains_list[[1]]
+      if (!length(v)) return(NULL)
+      data.table(
+        event_id = event_id,
+        event_type = event_type,
+        gene_id = gene_id_plot,
+        transcript_id = transcript_id_inc,
+        direction = "inclusion",
+        domain_id = as.character(v)
+      )
+    }, by = .I]
+    
+    exc_long <- hd[, {
+      v <- exc_only_domains_list[[1]]
+      if (!length(v)) return(NULL)
+      data.table(
+        event_id = event_id,
+        event_type = event_type,
+        gene_id = gene_id_plot,
+        transcript_id = transcript_id_exc,
+        direction = "exclusion",
+        domain_id = as.character(v)
+      )
+    }, by = .I]
+    
+    shared_long <- hd[, {
+      v <- either_domains_list[[1]]
+      if (!length(v)) return(NULL)
+      data.table(
+        event_id = event_id,
+        event_type = event_type,
+        gene_id = gene_id_plot,
+        transcript_id = transcript_id_inc,
+        direction = "shared",
+        domain_id = as.character(v)
+      )
+    }, by = .I]
+    
+    dom <- data.table::rbindlist(list(inc_long, exc_long, shared_long), use.names = TRUE, fill = TRUE)
+    dom[, .I := NULL]
+    if (!nrow(dom)) return(dom)
+    
+    dom <- dom[!is.na(domain_id) & nzchar(domain_id)]
+    
+    ef <- as.data.table(exon_features_dt)
+    ef[, dom_key := sprintf("%s;%s", as.character(database), as.character(name))]
+    feat_lookup <- unique(ef[, .(dom_key, database, name, alt_name)])
+    
+    dom <- merge(dom, feat_lookup, by.x = "domain_id", by.y = "dom_key", all.x = TRUE)
+    
+    missing_lab <- is.na(dom$database) | !nzchar(dom$database) | is.na(dom$name) | !nzchar(dom$name)
+    if (any(missing_lab)) {
+      parsed <- tstrsplit(dom$domain_id[missing_lab], ";", fixed = TRUE, keep = 1:2)
+      dom[missing_lab & (is.na(database) | !nzchar(database)), database := parsed[[1]]]
+      dom[missing_lab & (is.na(name) | !nzchar(name)), name := parsed[[2]]]
+    }
+    
+    dom[, database := fifelse(is.na(database) | !nzchar(database), "unlabeled", database)]
+    dom[, name := fifelse(is.na(name) | !nzchar(name), domain_id, name)]
+    dom[, alt_name := fifelse(is.na(alt_name), "", alt_name)]
+    dom[]
   }
   
   standardize_ppi_cols <- function(ppi_dt) {
@@ -395,7 +474,12 @@ server <- function(input, output, session) {
       signalp_features <- get_protein_features(c("signalp"), ann$annotations, test = TRUE)
       pf <- get_comprehensive_annotations(list(signalp_features, interpro_features))
       pf_dt <- as.data.table(pf)
-      if (!"transcript_id" %in% names(pf_dt) && "ensembl_transcript_id" %in% names(pf_dt)) pf_dt[, transcript_id := ensembl_transcript_id]
+      if (!"ensembl_transcript_id" %in% names(pf_dt) && "transcript_id" %in% names(pf_dt)) {
+        pf_dt[, ensembl_transcript_id := transcript_id]
+      }
+      if (!"transcript_id" %in% names(pf_dt) && "ensembl_transcript_id" %in% names(pf_dt)) {
+        pf_dt[, transcript_id := ensembl_transcript_id]
+      }
       if (!"gene_id" %in% names(pf_dt) && "gene_id.x" %in% names(pf_dt)) pf_dt[, gene_id := gene_id.x]
       rv$protein_features <- pf_dt
       ef <- get_exon_features(ann$annotations, pf_dt)
@@ -497,6 +581,9 @@ server <- function(input, output, session) {
       validate(need(!is.null(pf), "Provide a protein feature file or enable demo domains."))
       
       pf_dt <- as.data.table(pf)
+      if (!"ensembl_transcript_id" %in% names(pf_dt) && "transcript_id" %in% names(pf_dt)) {
+        pf_dt[, ensembl_transcript_id := transcript_id]
+      }
       if (!"transcript_id" %in% names(pf_dt) && "ensembl_transcript_id" %in% names(pf_dt)) {
         pf_dt[, transcript_id := ensembl_transcript_id]
       }
@@ -655,9 +742,17 @@ server <- function(input, output, session) {
   })
   
   protein_consequences <- reactive({
-    res <- downstream_results()
-    if (is.null(res) || is.null(res$domain_long)) {
-      showNotification("Run sequence/domain plots after loading proteins to view domain changes.", type = "message")
+    if (is.null(input$run_downstream) || input$run_downstream == 0) {
+      return(data.table())
+    }
+    res <- tryCatch(
+      downstream_results(),
+      error = function(e) {
+        showNotification(paste("Downstream results error:", e$message), type = "error")
+        NULL
+      }
+    )
+    if (is.null(res) || is.null(res$domain_long) || !nrow(res$domain_long)) {
       return(data.table())
     }
     dt <- as.data.table(res$domain_long)
@@ -936,22 +1031,13 @@ server <- function(input, output, session) {
           direction = "shared",
           domain_id = unlist(either_domains_list)
         )]
-        domain_long <- data.table::rbindlist(list(inc_long, exc_long, shared_long), use.names = TRUE, fill = TRUE)
-        domain_long <- domain_long[nzchar(domain_id)]
-        feat_lookup <- unique(as.data.table(rv$exon_features)[, .(feature_id, database, name, alt_name, gene_id)])
-        domain_long <- merge(domain_long, feat_lookup, by.x = "domain_id", by.y = "feature_id", all.x = TRUE)
-        if ("gene_id.x" %in% names(domain_long) && "gene_id.y" %in% names(domain_long)) {
-          domain_long[, gene_id := fifelse(!is.na(gene_id.x), gene_id.x, gene_id.y)]
-          domain_long[, c("gene_id.x", "gene_id.y") := NULL]
-        } else if ("gene_id.x" %in% names(domain_long)) {
-          setnames(domain_long, "gene_id.x", "gene_id")
-        } else if ("gene_id.y" %in% names(domain_long)) {
-          setnames(domain_long, "gene_id.y", "gene_id")
-        }
-        domain_long[, gene_id := fifelse(is.na(gene_id), gene_for_plot, gene_id)]
-        domain_long[, database := ifelse(is.na(database) | database == "", "unlabeled", database)]
-        domain_long[, name := ifelse(is.na(name) | name == "", domain_id, name)]
-        domain_long[, alt_name := ifelse(is.na(alt_name), "", alt_name)]
+        domain_long <- tryCatch(
+          build_domain_long(hd, rv$exon_features),
+          error = function(e) {
+            showNotification(paste("Domain-long construction failed:", e$message), type = "error")
+            data.table()
+          }
+        )
         domain_summary <- hd[, .(
           events = .N,
           with_domain_change = sum(diff_n > 0, na.rm = TRUE),
