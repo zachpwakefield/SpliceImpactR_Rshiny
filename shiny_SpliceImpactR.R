@@ -104,6 +104,34 @@ ui <- fluidPage(
       width = 8,
       tabsetPanel(
         tabPanel(
+          "How to use",
+          h3("Welcome to SpliceImpactR"),
+          p("This interface wraps the SpliceImpactR workflow so you can go from raw rMATS counts to transcript and protein consequences in a few clicks."),
+          h4("Workflow outline"),
+          tags$ol(
+            tags$li("Load annotations (demo, cached, downloaded, or local files)."),
+            tags$li("Load splicing inputs (demo manifest or your own rMATS/HIT Index outputs)."),
+            tags$li("Optionally load protein features and PPI maps before running consequence summaries."),
+            tags$li("Run differential inclusion, map events to transcripts, and explore downstream plots."),
+            tags$li("Use the download tab to export results for offline analysis.")
+          ),
+          h4("Tips for each section"),
+          tags$ul(
+            tags$li(strong("Differential inclusion:"), " adjust FDR and |\u0394PSI| thresholds, then filter by gene/transcript using the text boxes on each tab."),
+            tags$li(strong("Protein consequences:"), " load InterPro/SignalP features (demo or custom) before running; the tab summarizes domains overlapping inclusion exons."),
+            tags$li(strong("PPI impacts:"), " requires both mapped events and a PPI map. Load proteins first, then load PPIs, then run event mapping so transcripts align with interactions."),
+            tags$li(strong("Seq/Domain plots & Integrative summary:"), " run in order after mapping events and loading protein/PPI data; downstream plots rely on delta_psi from the DI step."),
+            tags$li(strong("Transcript pairs:"), " pick a gene and two transcripts to compare feature differences side by side."),
+            tags$li(strong("Filters:"), " the global gene/transcript/protein filters apply across tabs; per-tab gene filters override the global filter when set.")
+          ),
+          h4("Resources"),
+          tags$ul(
+            tags$li(tags$a(href = "https://github.com/ISTAT-TN/SpliceImpactR", target = "_blank", "SpliceImpactR on GitHub")),
+            tags$li(tags$a(href = "https://github.com/ISTAT-TN/SpliceImpactR/blob/main/README.md", target = "_blank", "Package README and examples")),
+            tags$li(tags$a(href = "https://doi.org/10.5281/zenodo.7944925", target = "_blank", "Zenodo archive"))
+          )
+        ),
+        tabPanel(
           "Status",
           h4("Annotation status"),
           tableOutput("annotation_summary"),
@@ -680,8 +708,12 @@ server <- function(input, output, session) {
     req(rv$mapped, rv$ppi_pairs)
     m <- as.data.table(rv$mapped)
     m <- apply_filters(m, gene_col = "gene_id", tx_col = "transcript_id", gene_override = input$ppi_gene_filter)
-    if (!nrow(m)) return(data.table())
+    if (!nrow(m)) return(list(per_tx = data.table(), per_event = data.table()))
     partners <- unique(as.data.table(rv$ppi_pairs))
+    if (!nrow(partners)) {
+      showNotification("No PPI interactions loaded. Load PPIDM or a custom PPI map, then rerun mapping.", type = "warning")
+      return(list(per_tx = data.table(), per_event = data.table()))
+    }
     partner_list <- partners[, .(
       n_ppi = uniqueN(partner_id),
       partner_sample = paste(head(unique(partner_id), 10), collapse = ";")
@@ -700,6 +732,10 @@ server <- function(input, output, session) {
         if (length(pvec)) paste(head(pvec, 20), collapse = ";") else "none"
       }
     ), by = .(event_id, event_type, gene_id)]
+    
+    if (!nrow(per_ev) || all(per_ev$n_ppi_total == 0)) {
+      showNotification("PPI map loaded, but no interactions matched the filtered transcripts.", type = "message")
+    }
     
     per_ev[, `:=`(
       n_inc_ppi = as.integer(n_ppi_total),
