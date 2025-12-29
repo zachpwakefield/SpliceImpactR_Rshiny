@@ -236,7 +236,7 @@ ui <- fluidPage(
           downloadButton("download_mapping", "Download event-to-transcript map"),
           downloadButton("download_proteins", "Download protein consequence table")
         ),
-        tabPanel(
+         tabPanel(
           "PPI",
           textInput("ppi_gene_filter", "Gene filter (PPI tab)", value = "", placeholder = "Overrides global gene filter"),
           helpText("Run sequence/domain plots with PPIs loaded to populate this tab."),
@@ -259,10 +259,11 @@ server <- function(input, output, session) {
     sample_frame = NULL,
     splicing = NULL,
     di = NULL,
-    mapped = NULL,
+    di_sig = NULL,
+    matched = NULL,
     protein_features = NULL,
     exon_features = NULL,
-    ppi_map = NULL
+    ppidm = NULL
   )
   
   output$di_colnames <- renderPrint({
@@ -389,11 +390,9 @@ server <- function(input, output, session) {
       rv$sample_frame <- manifest
       
       incProgress(0.35, detail = "Proteins (demo InterPro/SignalP)")
-      pf <- get_protein_features(
-        biomaRt_databases = c("interpro", "signalp"),
-        gtf_df = ann$annotations,
-        test = TRUE
-      )
+      interpro_features <- get_protein_features(c("interpro"), ann$annotations, test = TRUE)
+      signalp_features <- get_protein_features(c("signalp"), ann$annotations, test = TRUE)
+      pf <- get_comprehensive_annotations(list(signalp_features, interpro_features))
       pf_dt <- as.data.table(pf)
       if (!"transcript_id" %in% names(pf_dt) && "ensembl_transcript_id" %in% names(pf_dt)) pf_dt[, transcript_id := ensembl_transcript_id]
       if (!"gene_id" %in% names(pf_dt) && "gene_id.x" %in% names(pf_dt)) pf_dt[, gene_id := gene_id.x]
@@ -404,7 +403,8 @@ server <- function(input, output, session) {
       rv$exon_features <- ef
       
       incProgress(0.5, detail = "Event mapping")
-      rv$mapped <- match_events_to_annotations_vec(rv$splicing, rv$annotations$annotations)
+      rv$di_sig <- NULL
+      rv$matched <- NULL
       
       incProgress(0.65, detail = "Differential inclusion (demo)")
       rv$di <- get_differential_inclusion(
@@ -414,16 +414,11 @@ server <- function(input, output, session) {
         parallel_glm = FALSE,
         verbose = FALSE
       )
+      rv$di_sig <- keep_sig_pairs(rv$di, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
+      rv$matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
       
       incProgress(0.8, detail = "PPI (demo PPIDM)")
-      ppidm <- get_ppidm(test = TRUE)
-      ppi_raw <- get_isoform_interactions(rv$protein_features, ppidm, init = TRUE, save = FALSE)
-      ppi_std <- standardize_ppi_cols(ppi_raw)
-      if (is.null(ppi_std)) {
-        showNotification("Demo PPIDM map did not expose transcript columns.", type = "error")
-      } else {
-        rv$ppi_map <- ppi_std
-      }
+      rv$ppidm <- get_ppidm(test = TRUE)
       
       incProgress(1, detail = "Demo ready")
     })
@@ -456,10 +451,11 @@ server <- function(input, output, session) {
       )
       rv$splicing <- data
       rv$di <- NULL
-      rv$mapped <- NULL
+      rv$di_sig <- NULL
+      rv$matched <- NULL
       rv$protein_features <- NULL
       rv$exon_features <- NULL
-      rv$ppi_map <- NULL
+      rv$ppidm <- NULL
       incProgress(1, detail = "Events loaded")
     })
   })
@@ -469,11 +465,17 @@ server <- function(input, output, session) {
     withProgress(message = "Loading protein features", value = 0, {
       pf <- NULL
       if (isTruthy(input$use_demo_proteins)) {
-        pf <- get_protein_features(
-          biomaRt_databases = c("interpro", "signalp"),
+        interpro_features <- get_protein_features(
+          biomaRt_databases = c("interpro"),
           gtf_df = rv$annotations$annotations,
           test = TRUE
         )
+        signalp_features <- get_protein_features(
+          biomaRt_databases = c("signalp"),
+          gtf_df = rv$annotations$annotations,
+          test = TRUE
+        )
+        pf <- get_comprehensive_annotations(list(signalp_features, interpro_features))
       }
       
       if (!is.null(input$protein_file)) {
@@ -505,24 +507,20 @@ server <- function(input, output, session) {
         setnames(ef, "gene_id.x", "gene_id")
       }
       rv$exon_features <- ef
-      rv$ppi_map <- NULL
+      rv$ppidm <- NULL
       incProgress(1, detail = "Protein features ready")
     })
   })
   
   observeEvent(input$load_ppi, {
-    req(rv$protein_features)
     withProgress(message = "Loading PPI interactions", value = 0, {
       ppidm <- if (isTRUE(input$use_demo_ppi)) {
         get_ppidm(test = TRUE)
       } else {
         get_ppidm(download = TRUE)
       }
-      ppi_raw <- get_isoform_interactions(rv$protein_features, ppidm, init = TRUE, save = FALSE)
-      ppi_std <- standardize_ppi_cols(ppi_raw)
-      validate(need(!is.null(ppi_std), "Could not detect transcript columns in PPI map"))
-      rv$ppi_map <- ppi_std
-      incProgress(1, detail = "PPI ready")
+      rv$ppidm <- ppidm
+      incProgress(1, detail = "PPI metadata ready")
     })
   })
   
@@ -543,15 +541,19 @@ server <- function(input, output, session) {
         verbose = FALSE
       )
       rv$di <- di
+      rv$di_sig <- keep_sig_pairs(di, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
+      rv$matched <- NULL
       incProgress(1, detail = "Differential inclusion complete")
     })
   })
   
   observeEvent(input$map_events, {
-    req(rv$splicing, rv$annotations)
+    req(rv$di, rv$annotations)
     withProgress(message = "Matching events to transcripts", value = 0, {
-      mapped <- match_events_to_annotations_vec(rv$splicing, rv$annotations$annotations)
-      rv$mapped <- mapped
+      rv$di_sig <- keep_sig_pairs(rv$di, padj_thr = input$padj_thr, dpsi_thr = input$dpsi_thr)
+      req(rv$di_sig)
+      matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
+      rv$matched <- matched
       incProgress(1, detail = "Mapping complete")
     })
   })
@@ -614,27 +616,27 @@ server <- function(input, output, session) {
   )
   
   output$mapping_summary <- renderTable({
-    req(rv$mapped)
+    req(rv$matched)
     keep <- c("event_type", "gene_id", "transcript_id")
-    tmp <- rv$mapped[, ..keep]
+    tmp <- rv$matched[, ..keep]
     tmp <- apply_filters(tmp, gene_col = "gene_id", tx_col = "transcript_id", gene_override = input$map_gene_filter)
     tmp[, .(n_events = .N, n_transcripts = uniqueN(transcript_id)), by = event_type][order(-n_events)]
   })
   
   output$mapping_gene_table <- renderTable({
-    req(rv$mapped)
+    req(rv$matched)
     gene_filter_active <- nzchar(input$map_gene_filter) || nzchar(input$gene_filter)
     if (!gene_filter_active) return(NULL)
     keep <- c("event_id", "event_type", "gene_id", "transcript_id", "exons", "inc_exons_by_idx")
-    dat <- apply_filters(rv$mapped[, ..keep], gene_col = "gene_id", tx_col = "transcript_id", gene_override = input$map_gene_filter)
+    dat <- apply_filters(rv$matched[, ..keep], gene_col = "gene_id", tx_col = "transcript_id", gene_override = input$map_gene_filter)
     if (!nrow(dat)) return(NULL)
     dat[order(event_id)][1:min(.N, 50)]
   })
   
   observeEvent(input$show_mapping_table, {
-    req(rv$mapped)
+    req(rv$matched)
     keep <- c("event_id", "event_type", "gene_id", "transcript_id", "exons", "inc_exons_by_idx")
-    dat <- apply_filters(rv$mapped[, ..keep], gene_col = "gene_id", tx_col = "transcript_id", gene_override = input$map_gene_filter)
+    dat <- apply_filters(rv$matched[, ..keep], gene_col = "gene_id", tx_col = "transcript_id", gene_override = input$map_gene_filter)
     showModal(modalDialog(
       title = "Mapping table",
       size = "l",
@@ -717,8 +719,8 @@ server <- function(input, output, session) {
   output$download_mapping <- downloadHandler(
     filename = function() paste0("spliceimpactr_event_mapping_", Sys.Date(), ".csv"),
     content = function(file) {
-      req(rv$mapped)
-      fwrite(rv$mapped, file)
+      req(rv$matched)
+      fwrite(rv$matched, file)
     }
   )
   
@@ -823,18 +825,16 @@ server <- function(input, output, session) {
   )
   
   downstream_results <- eventReactive(input$run_downstream, {
-    req(rv$mapped, rv$annotations, rv$exon_features)
+    req(rv$matched, rv$annotations, rv$exon_features)
     if (is.null(rv$annotations$sequences)) {
       showNotification("Annotation sequences are required for downstream plots.", type = "error")
       return(NULL)
     }
     withProgress(message = "Running sequence/domain plots", value = 0, {
-      map_dt <- unique(as.data.table(rv$mapped), by = c("event_id", "transcript_id"))
-      if (!"delta_psi" %in% names(map_dt)) {
-        di_dt <- normalize_di_cols(rv$di)
-        if (!is.null(di_dt) && "event_id" %in% names(di_dt)) {
-          map_dt <- merge(map_dt, di_dt[, .(event_id, delta_psi)], by = "event_id", all.x = TRUE)
-        }
+      map_dt <- unique(as.data.table(rv$matched), by = c("event_id", "transcript_id"))
+      di_dt <- normalize_di_cols(rv$di)
+      if (!is.null(di_dt) && "event_id" %in% names(di_dt)) {
+        map_dt <- merge(map_dt, di_dt[, .(event_id, delta_psi)], by = "event_id", all.x = TRUE)
       }
       if (!"delta_psi" %in% names(map_dt) || all(is.na(map_dt$delta_psi))) {
         showNotification("Downstream plots require delta_psi on mapped events; run DI first or supply a table with delta_psi.", type = "error")
@@ -872,8 +872,7 @@ server <- function(input, output, session) {
                               error = function(e) {showNotification(paste("get_domains failed:", e$message), type="error"); NULL})
       if (!is.null(hits_domain) && !is.null(rv$sample_frame) && !is.null(rv$protein_features)) {
         bg <- tryCatch(get_background(
-          source = "hit_index",
-          input = rv$sample_frame,
+          source = "annotated",
           annotations = rv$annotations$annotations,
           protein_features = rv$protein_features
         ), error = function(e) {showNotification(paste("get_background failed:", e$message), type="error"); NULL})
@@ -932,11 +931,16 @@ server <- function(input, output, session) {
       
       hits_final <- NULL
       ppi_plot <- NULL
-      if (!is.null(rv$ppi_map) && !is.null(hits_domain)) {
-        if (!all(c("ensembl_transcript_id", "i.ensembl_transcript_id") %in% names(rv$ppi_map))) {
-          showNotification("PPI map missing ensembl_transcript_id/i.ensembl_transcript_id columns.", type = "error")
-        } else {
-          hits_final <- tryCatch(get_ppi_switches(hits_domain, rv$ppi_map),
+      if (!is.null(rv$ppidm) && !is.null(hits_domain) && nrow(hits_domain)) {
+        restrict_ids <- unique(c(hits_domain$transcript_id_inc, hits_domain$transcript_id_exc))
+        restrict_pf <- rv$protein_features[ensembl_transcript_id %in% restrict_ids]
+        ppi_raw <- tryCatch(
+          get_isoform_interactions(restrict_pf, rv$ppidm, init = TRUE, save = FALSE),
+          error = function(e) {showNotification(paste("get_isoform_interactions failed:", e$message), type = "error"); NULL}
+        )
+        ppi_std <- if (!is.null(ppi_raw)) standardize_ppi_cols(ppi_raw) else NULL
+        if (!is.null(ppi_std)) {
+          hits_final <- tryCatch(get_ppi_switches(hits_domain, ppi_std),
                                  error = function(e) {
                                    showNotification(paste("get_ppi_switches failed:", e$message), type = "error")
                                    NULL
@@ -945,7 +949,7 @@ server <- function(input, output, session) {
             ppi_plot <- tryCatch(plot_ppi_summary(hits_final), error = function(e) NULL)
           }
         }
-      } else if (is.null(rv$ppi_map)) {
+      } else if (is.null(rv$ppidm)) {
         showNotification("Load PPI interactions to compute PPI switches alongside domain hits.", type = "message")
       }
       
