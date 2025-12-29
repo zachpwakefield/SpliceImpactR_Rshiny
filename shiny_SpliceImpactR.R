@@ -365,6 +365,10 @@ server <- function(input, output, session) {
     if (is.null(x) || !is.data.frame(x)) return(NULL)
     as.data.table(x)
   }
+  abort_stage <- function(stage) {
+    showNotification(paste("Downstream stopped at:", stage), type = "error")
+    NULL
+  }
   
   build_domain_long <- function(hits_domain_dt, exon_features_dt) {
     hd <- as.data.table(hits_domain_dt)
@@ -1003,12 +1007,12 @@ server <- function(input, output, session) {
         attach_sequences(map_dt, rv$annotations$sequences),
         error = function(e) {
           showNotification(paste("attach_sequences failed:", e$message), type = "error")
-          return(NULL)
+          return(abort_stage("attach_sequences"))
         }
       )
       if (is.null(x_seq)) return(NULL)
       pairs <- tryCatch(get_pairs(x_seq, source = "multi"), error = function(e) {
-        showNotification(paste("get_pairs failed:", e$message), type = "error"); NULL
+        showNotification(paste("get_pairs failed:", e$message), type = "error"); abort_stage("get_pairs")
       })
       if (is.null(pairs)) return(NULL)
       
@@ -1017,10 +1021,11 @@ server <- function(input, output, session) {
         compare_sequence_frame(pairs, rv$annotations$annotations),
         error = function(e) {showNotification(paste("compare_sequence_frame failed:", e$message), type = "error"); NULL})
       seq_compare <- as_dt_or_null(seq_compare)
-      if (!has_df_rows(seq_compare)) return(NULL)
+      if (!has_df_rows(seq_compare)) return(abort_stage("compare_sequence_frame"))
       proximal_output <- tryCatch(get_proximal_shift_from_hits(pairs),
                                   error = function(e) {showNotification(paste("get_proximal_shift_from_hits failed:", e$message), type = "error"); NULL})
-      proximal_plot <- if (!is.null(proximal_output) && nrow(proximal_output) > 0) {
+      proximal_output <- as_dt_or_null(proximal_output)
+      proximal_plot <- if (has_df_rows(proximal_output)) {
         tryCatch(plot_prox_dist(proximal_output), error = function(e) NULL)
       } else NULL
       alignment_plot <- tryCatch(plot_alignment_summary(seq_compare), error = function(e) NULL)
