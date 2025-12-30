@@ -239,7 +239,9 @@ ui <- fluidPage(
         ),
         tabPanel(
           "Event probe",
-          helpText("Select an event ID from DI results to probe PSI by sample/condition."),
+          helpText("Probe PSI by gene, event type, and event ID drawn from DI results and splicing table."),
+          selectizeInput("probe_gene", "Gene", choices = NULL, options = list(placeholder = "Select gene")),
+          selectInput("probe_event_type", "Event type", choices = c(""), selected = NULL),
           selectizeInput("probe_event", "Event ID", choices = NULL, options = list(placeholder = "Select event_id")),
           actionButton("run_probe", "Probe event", width = "100%"),
           h4("PSI by sample/condition"),
