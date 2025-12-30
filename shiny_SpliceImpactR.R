@@ -203,6 +203,10 @@ ui <- fluidPage(
           h4("Domain overlaps with inclusion exons"),
           tableOutput("protein_summary"),
           tableOutput("protein_gene_table"),
+          h4("Single-gene transcript comparison"),
+          helpText("When a single gene with exactly two transcripts is selected, shows shared vs. unique domains by database."),
+          tableOutput("protein_pair_summary"),
+          tableOutput("protein_pair_detail"),
           actionButton("show_protein_table", "Show full protein consequence table")
         ),
         tabPanel(
@@ -903,6 +907,62 @@ server <- function(input, output, session) {
     if (!nrow(cons)) return(NULL)
     cols <- c("event_id", "event_type", "gene_id", "transcript_id", "direction", "database", "name", "alt_name")
     cons[, ..cols][order(event_id)][1:min(.N, 50)]
+  })
+  
+  protein_gene_pair_diff <- reactive({
+    cons <- protein_consequences()
+    if (!nrow(cons)) return(NULL)
+    cons <- apply_filters(cons, gene_col = "gene_id", tx_col = "transcript_id", prot_col = "ensembl_peptide_id", gene_override = input$prot_gene_filter)
+    if (!nrow(cons)) return(NULL)
+    genes <- unique(cons$gene_id)
+    if (length(genes) != 1) return(NULL)
+    txs <- unique(cons$transcript_id)
+    if (length(txs) != 2) return(NULL)
+    cols <- c("database", "domain_id", "name", "alt_name")
+    a_feats <- unique(cons[transcript_id == txs[1], ..cols])
+    b_feats <- unique(cons[transcript_id == txs[2], ..cols])
+    shared <- merge(a_feats, b_feats, by = cols)
+    if (nrow(shared)) shared[, status := "shared"]
+    only_a <- fsetdiff(a_feats, b_feats)
+    if (nrow(only_a)) only_a[, status := "only A"]
+    only_b <- fsetdiff(b_feats, a_feats)
+    if (nrow(only_b)) only_b[, status := "only B"]
+    out <- rbindlist(list(shared, only_a, only_b), use.names = TRUE, fill = TRUE)
+    if (!nrow(out)) return(NULL)
+    out[, status := factor(status, levels = c("shared", "only A", "only B"))]
+    summary_tbl <- out[, .(
+      shared = sum(status == "shared"),
+      only_A = sum(status == "only A"),
+      only_B = sum(status == "only B"),
+      total_A = sum(status %in% c("shared", "only A")),
+      total_B = sum(status %in% c("shared", "only B"))
+    ), by = database][order(-shared - only_A - only_B)]
+    
+    detail_diff <- unique(out[status != "shared"])
+    if (nrow(detail_diff)) {
+      detail_diff[, transcript_id := ifelse(status == "only A", txs[1], txs[2])]
+    }
+    
+    list(
+      summary = summary_tbl,
+      differences = detail_diff
+    )
+  })
+  
+  output$protein_pair_summary <- renderTable({
+    res <- protein_gene_pair_diff()
+    if (is.null(res)) return(NULL)
+    res$summary
+  })
+  
+  output$protein_pair_detail <- renderTable({
+    res <- protein_gene_pair_diff()
+    if (is.null(res)) return(NULL)
+    diffs <- res$differences
+    if (!nrow(diffs)) return(NULL)
+    diffs[, .(status, transcript_id, database, name, alt_name)][
+      order(status, database, name)
+    ][1:min(.N, 100)]
   })
   
   observeEvent(input$show_protein_table, {
