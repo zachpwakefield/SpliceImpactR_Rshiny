@@ -114,8 +114,7 @@ ui <- fluidPage(
       actionButton("run_downstream", "Run sequence/domain + PPI summary", width = "100%"),
       hr(),
       h4("HIT/PSI comparisons"),
-      helpText("Compute HIT index and PSI comparisons across conditions."),
-      actionButton("run_hit_overview_sidebar", "Run HIT/PSI summaries", width = "100%")
+      helpText("Compute HIT index and PSI comparisons across conditions from the HIT/PSI summaries tab.")
     ),
     mainPanel(
       width = 8,
@@ -799,8 +798,9 @@ server <- function(input, output, session) {
     sig <- sig[is.finite(padj) & padj <= input$padj_thr &
                  is.finite(delta_psi) & abs(delta_psi) >= input$dpsi_thr]
     sig <- apply_filters(sig, gene_col = "gene_id", gene_override = input$di_gene_filter)
-    if ("padj" %in% names(sig)) sig[, padj := signif(padj, 4)]
-    if ("delta_psi" %in% names(sig)) sig[, delta_psi := signif(delta_psi, 4)]
+    if ("padj" %in% names(sig)) sig[, padj := signif(padj, 6)]
+    if ("pvalue" %in% names(sig)) sig[, pvalue := signif(pvalue, 6)]
+    if ("delta_psi" %in% names(sig)) sig[, delta_psi := signif(delta_psi, 6)]
     sig[order(padj)][1:min(.N, 25)]
   })
   
@@ -1317,7 +1317,7 @@ server <- function(input, output, session) {
     res$plot
   })
   
-  hit_overview <- eventReactive(input$run_hit_overview + input$run_hit_overview_sidebar, {
+  hit_overview <- eventReactive(input$run_hit_overview, {
     req(rv$sample_frame, rv$splicing)
     evt_type <- input$psi_overview_event_type
     if (is.null(evt_type) || !nzchar(evt_type) || !evt_type %chin% c("AFE", "ALE")) {
