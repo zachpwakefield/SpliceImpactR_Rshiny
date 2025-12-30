@@ -250,10 +250,11 @@ ui <- fluidPage(
         tabPanel(
           "HIT/PSI summaries",
           helpText("Run HIT index and PSI overview comparisons across conditions."),
+          selectInput("psi_overview_event_type", "PSI overview event type", choices = c("AFE", "ALE"), selected = "AFE"),
           actionButton("run_hit_overview", "Run HIT/PSI summaries", width = "100%"),
           h4("HIT index comparison"),
           plotOutput("hit_compare_plot", height = 400),
-          h4("PSI overview (AFE example)"),
+          h4("PSI overview (AFE/ALE)"),
           plotOutput("psi_overview_plot", height = 400),
           h4("Proximal vs distal (AFE/ALE)"),
           plotOutput("proximal_plot", height = 300)
@@ -1252,6 +1253,10 @@ server <- function(input, output, session) {
   
   hit_overview <- eventReactive(input$run_hit_overview + input$run_hit_overview_sidebar, {
     req(rv$sample_frame, rv$splicing)
+    evt_type <- input$psi_overview_event_type
+    if (is.null(evt_type) || !nzchar(evt_type) || !evt_type %chin% c("AFE", "ALE")) {
+      evt_type <- "AFE"
+    }
     
     hc <- tryCatch(
       compare_hit_index(rv$sample_frame, condition_map = c(control = "control", test = "case")),
@@ -1259,7 +1264,7 @@ server <- function(input, output, session) {
     )
     
     ov <- tryCatch(
-      overview_splicing_comparison_fixed(rv$splicing, rv$sample_frame, depth_norm = "exon_files", event_type = "AFE"),
+      overview_splicing_comparison_fixed(rv$splicing, rv$sample_frame, depth_norm = "exon_files", event_type = evt_type),
       error = function(e) { showNotification(paste("overview_splicing_comparison_fixed failed:", e$message), type = "error"); NULL }
     )
     
