@@ -77,6 +77,14 @@ ui <- fluidPage(
       hr(),
       h4("Protein features"),
       checkboxInput("use_demo_proteins", "Use bundled InterPro/SignalP demo domains", value = TRUE),
+      selectizeInput(
+        "biomart_features",
+        "Biomart protein features",
+        choices = c("interpro", "signalp", "seg", "ncoils", "mobidblite", "tmhmm"),
+        selected = c("interpro", "signalp"),
+        multiple = TRUE,
+        options = list(plugins = list("remove_button"))
+      ),
       fileInput("protein_file", "Upload protein features (RDS/CSV)", accept = c(".rds", ".csv", ".tsv")),
       actionButton("load_proteins", "Load protein features", width = "100%"),
       hr(),
@@ -94,6 +102,7 @@ ui <- fluidPage(
       numericInput("min_reads", "Minimum total reads per site/sample", value = 10, min = 0),
       numericInput("padj_thr", "FDR cutoff", value = 0.05, min = 0, step = 0.01),
       numericInput("dpsi_thr", "|Delta PSI| cutoff", value = 0.1, min = 0, step = 0.01),
+      textInput("cooks_cutoff", "Cooks cutoff", value = "4/n"),
       actionButton("run_di", "Run differential inclusion", width = "100%"),
       hr(),
       h4("Annotation mapping"),
@@ -105,8 +114,7 @@ ui <- fluidPage(
       actionButton("run_downstream", "Run sequence/domain + PPI summary", width = "100%"),
       hr(),
       h4("HIT/PSI comparisons"),
-      helpText("Compute HIT index and PSI comparisons across conditions."),
-      actionButton("run_hit_overview_sidebar", "Run HIT/PSI summaries", width = "100%")
+      helpText("Compute HIT index and PSI comparisons across conditions from the HIT/PSI summaries tab.")
     ),
     mainPanel(
       width = 8,
@@ -163,6 +171,8 @@ ui <- fluidPage(
           "Status",
           h4("Annotation status"),
           tableOutput("annotation_summary"),
+          h4("Active parameters"),
+          tableOutput("parameter_summary"),
           h4("Splicing inputs"),
           tableOutput("sample_preview"),
           h4("Event counts"),
@@ -189,10 +199,23 @@ ui <- fluidPage(
           "Protein consequences",
           textInput("prot_gene_filter", "Gene filter (protein tab)", value = "", placeholder = "Overrides global gene filter"),
           helpText("Run sequence/domain plots after loading proteins to summarize inclusion vs. exclusion domain changes."),
+          h5("Probe domains by event"),
+          helpText("Select gene → event type → event to list affected transcripts and domains."),
+          selectizeInput("protein_probe_gene", "Gene", choices = NULL, options = list(placeholder = "Select gene")),
+          selectInput("protein_probe_event_type", "Event type", choices = c(""), selected = NULL),
+          selectizeInput("protein_probe_event", "Event ID", choices = NULL, options = list(placeholder = "Select event_id")),
+          actionButton("run_protein_probe", "Probe protein consequences", width = "100%"),
           plotOutput("protein_plot", height = 350),
           h4("Domain overlaps with inclusion exons"),
           tableOutput("protein_summary"),
           tableOutput("protein_gene_table"),
+          h4("Single-gene transcript comparison"),
+          helpText("When a single gene with exactly two transcripts is selected, shows shared vs. unique domains by database."),
+          tableOutput("protein_pair_summary"),
+          tableOutput("protein_pair_detail"),
+          h4("Event transcripts and domains"),
+          tableOutput("protein_probe_tx_table"),
+          tableOutput("protein_probe_domain_table"),
           actionButton("show_protein_table", "Show full protein consequence table")
         ),
         tabPanel(
@@ -239,7 +262,7 @@ ui <- fluidPage(
         ),
         tabPanel(
           "Event probe",
-          helpText("Probe PSI by gene, event type, and event ID drawn from DI results and splicing table."),
+          helpText("Probe PSI by selecting a gene, then an event type, then (if needed) an event ID for non-AFE/ALE events."),
           selectizeInput("probe_gene", "Gene", choices = NULL, options = list(placeholder = "Select gene")),
           selectInput("probe_event_type", "Event type", choices = c(""), selected = NULL),
           selectizeInput("probe_event", "Event ID", choices = NULL, options = list(placeholder = "Select event_id")),
@@ -250,10 +273,11 @@ ui <- fluidPage(
         tabPanel(
           "HIT/PSI summaries",
           helpText("Run HIT index and PSI overview comparisons across conditions."),
+          selectInput("psi_overview_event_type", "PSI overview event type", choices = c("AFE", "ALE"), selected = "AFE"),
           actionButton("run_hit_overview", "Run HIT/PSI summaries", width = "100%"),
           h4("HIT index comparison"),
           plotOutput("hit_compare_plot", height = 400),
-          h4("PSI overview (AFE example)"),
+          h4("PSI overview (AFE/ALE)"),
           plotOutput("psi_overview_plot", height = 400),
           h4("Proximal vs distal (AFE/ALE)"),
           plotOutput("proximal_plot", height = 300)
@@ -496,9 +520,15 @@ server <- function(input, output, session) {
       rv$sample_frame <- manifest
       
       incProgress(0.35, detail = "Proteins (demo InterPro/SignalP)")
-      interpro_features <- get_protein_features(c("interpro"), ann$annotations, test = TRUE)
-      signalp_features <- get_protein_features(c("signalp"), ann$annotations, test = TRUE)
-      pf <- get_comprehensive_annotations(list(signalp_features, interpro_features))
+      bm_features <- intersect(input$biomart_features, c("interpro", "signalp", "seg", "ncoils", "mobidblite", "tmhmm"))
+      if (!length(bm_features)) bm_features <- c("interpro", "signalp")
+      pf <- get_protein_features(
+        biomaRt_databases = bm_features,
+        gtf_df = ann$annotations,
+        species = input$annotation_species,
+        release = input$annotation_release,
+        test = TRUE
+      )
       pf_dt <- as.data.table(pf)
       if (!"ensembl_transcript_id" %in% names(pf_dt) && "transcript_id" %in% names(pf_dt)) {
         pf_dt[, ensembl_transcript_id := transcript_id]
@@ -521,7 +551,7 @@ server <- function(input, output, session) {
       rv$di <- get_differential_inclusion(
         rv$splicing,
         min_total_reads = input$min_reads,
-        cooks_cutoff = "4/n",
+        cooks_cutoff = input$cooks_cutoff,
         parallel_glm = FALSE,
         verbose = FALSE
       )
@@ -590,18 +620,17 @@ server <- function(input, output, session) {
     req(rv$annotations)
     withProgress(message = "Loading protein features", value = 0, {
       pf <- NULL
+      bm_features <- intersect(input$biomart_features, c("interpro", "signalp", "seg", "ncoils", "mobidblite", "tmhmm"))
+      
       if (isTruthy(input$use_demo_proteins)) {
-        interpro_features <- get_protein_features(
-          biomaRt_databases = c("interpro"),
+        if (!length(bm_features)) bm_features <- c("interpro", "signalp")
+        pf <- get_protein_features(
+          biomaRt_databases = bm_features,
           gtf_df = rv$annotations$annotations,
+          species = input$annotation_species,
+          release = input$annotation_release,
           test = TRUE
         )
-        signalp_features <- get_protein_features(
-          biomaRt_databases = c("signalp"),
-          gtf_df = rv$annotations$annotations,
-          test = TRUE
-        )
-        pf <- get_comprehensive_annotations(list(signalp_features, interpro_features))
       }
       
       if (!is.null(input$protein_file)) {
@@ -612,6 +641,16 @@ server <- function(input, output, session) {
           delim <- if (ext == "tsv") "\t" else ","
           fread(input$protein_file$datapath, sep = delim, data.table = TRUE)
         }
+      }
+      
+      if (is.null(pf) && length(bm_features)) {
+        pf <- get_protein_features(
+          biomaRt_databases = bm_features,
+          gtf_df = rv$annotations$annotations,
+          species = input$annotation_species,
+          release = input$annotation_release,
+          test = FALSE
+        )
       }
       
       validate(need(!is.null(pf), "Provide a protein feature file or enable demo domains."))
@@ -666,7 +705,7 @@ server <- function(input, output, session) {
       di <- get_differential_inclusion(
         rv$splicing,
         min_total_reads = input$min_reads,
-        cooks_cutoff = "4/n",
+        cooks_cutoff = input$cooks_cutoff,
         parallel_glm = FALSE,
         verbose = FALSE
       )
@@ -685,7 +724,6 @@ server <- function(input, output, session) {
       req(rv$di_sig)
       matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
       rv$matched <- as.data.table(matched)
-      updateSelectizeInput(session, "probe_event", choices = unique(rv$di_norm$event_id), server = TRUE)
       incProgress(1, detail = "Mapping complete")
     })
   })
@@ -698,6 +736,44 @@ server <- function(input, output, session) {
       Transcripts = ann[type == "transcript", uniqueN(transcript_id)],
       Exons = ann[type == "exon", .N],
       Protein.coding.transcripts = ann[!is.na(protein_id), uniqueN(transcript_id)]
+    )
+  })
+  
+  output$parameter_summary <- renderTable({
+    ann_mode <- input$annotation_mode
+    features <- input$biomart_features
+    data.frame(
+      Parameter = c(
+        "Annotation mode",
+        "Species",
+        "Annotation release",
+        "rMATS counts",
+        "Event types",
+        "Keep annotated first/last",
+        "Minimum reads",
+        "Cooks cutoff",
+        "FDR cutoff",
+        "|Delta PSI| cutoff",
+        "Biomart protein features",
+        "Demo protein features",
+        "Demo PPIs"
+      ),
+      Value = c(
+        if (nzchar(ann_mode)) ann_mode else "not set",
+        if (nzchar(input$annotation_species)) input$annotation_species else "not set",
+        if (!is.null(input$annotation_release)) input$annotation_release else "not set",
+        if (nzchar(input$rmats_use)) input$rmats_use else "not set",
+        paste(input$event_types, collapse = ", "),
+        if (isTRUE(input$keep_first_last)) "Yes" else "No",
+        input$min_reads,
+        input$cooks_cutoff,
+        input$padj_thr,
+        input$dpsi_thr,
+        if (length(features)) paste(features, collapse = ", ") else "not set",
+        if (isTRUE(input$use_demo_proteins)) "Demo InterPro/SignalP" else "User provided",
+        if (isTRUE(input$use_demo_ppi)) "Demo PPIDM" else "Downloaded/none"
+      ),
+      stringsAsFactors = FALSE
     )
   })
   
@@ -727,7 +803,7 @@ server <- function(input, output, session) {
   
   output$di_table <- renderTable({
     req(rv$di_norm)
-    sig <- rv$di_norm
+    sig <- copy(rv$di_norm)
     if (is.null(sig)) {
       showNotification("Differential inclusion results missing padj or delta_psi.", type = "error")
       return(NULL)
@@ -735,6 +811,9 @@ server <- function(input, output, session) {
     sig <- sig[is.finite(padj) & padj <= input$padj_thr &
                  is.finite(delta_psi) & abs(delta_psi) >= input$dpsi_thr]
     sig <- apply_filters(sig, gene_col = "gene_id", gene_override = input$di_gene_filter)
+    if ("padj" %in% names(sig)) sig[, padj := signif(padj, 6)]
+    if ("pvalue" %in% names(sig)) sig[, pvalue := signif(pvalue, 6)]
+    if ("delta_psi" %in% names(sig)) sig[, delta_psi := signif(delta_psi, 6)]
     sig[order(padj)][1:min(.N, 25)]
   })
   
@@ -837,6 +916,181 @@ server <- function(input, output, session) {
     if (!nrow(cons)) return(NULL)
     cols <- c("event_id", "event_type", "gene_id", "transcript_id", "direction", "database", "name", "alt_name")
     cons[, ..cols][order(event_id)][1:min(.N, 50)]
+  })
+  
+  protein_gene_pair_diff <- reactive({
+    cons <- protein_consequences()
+    if (!nrow(cons)) return(NULL)
+    cons <- apply_filters(cons, gene_col = "gene_id", tx_col = "transcript_id", prot_col = "ensembl_peptide_id", gene_override = input$prot_gene_filter)
+    if (!nrow(cons)) return(NULL)
+    genes <- unique(cons$gene_id)
+    if (length(genes) != 1) return(NULL)
+    txs <- unique(cons$transcript_id)
+    if (length(txs) != 2) return(NULL)
+    cols <- c("database", "domain_id", "name", "alt_name")
+    a_feats <- unique(cons[transcript_id == txs[1], ..cols])
+    b_feats <- unique(cons[transcript_id == txs[2], ..cols])
+    shared <- merge(a_feats, b_feats, by = cols)
+    if (nrow(shared)) shared[, status := "shared"]
+    only_a <- fsetdiff(a_feats, b_feats)
+    if (nrow(only_a)) only_a[, status := "only A"]
+    only_b <- fsetdiff(b_feats, a_feats)
+    if (nrow(only_b)) only_b[, status := "only B"]
+    out <- rbindlist(list(shared, only_a, only_b), use.names = TRUE, fill = TRUE)
+    if (!nrow(out)) return(NULL)
+    out[, status := factor(status, levels = c("shared", "only A", "only B"))]
+    summary_tbl <- out[, .(
+      shared = sum(status == "shared"),
+      only_A = sum(status == "only A"),
+      only_B = sum(status == "only B"),
+      total_A = sum(status %in% c("shared", "only A")),
+      total_B = sum(status %in% c("shared", "only B"))
+    ), by = database][order(-shared - only_A - only_B)]
+    
+    detail_diff <- unique(out[status != "shared"])
+    if (nrow(detail_diff)) {
+      detail_diff[, transcript_id := ifelse(status == "only A", txs[1], txs[2])]
+    }
+    
+    list(
+      summary = summary_tbl,
+      differences = detail_diff
+    )
+  })
+  
+  output$protein_pair_summary <- renderTable({
+    res <- protein_gene_pair_diff()
+    if (is.null(res)) return(NULL)
+    res$summary
+  })
+  
+  output$protein_pair_detail <- renderTable({
+    res <- protein_gene_pair_diff()
+    if (is.null(res)) return(NULL)
+    diffs <- res$differences
+    if (!nrow(diffs)) return(NULL)
+    diffs[, .(status, transcript_id, database, name, alt_name)][
+      order(status, database, name)
+    ][1:min(.N, 100)]
+  })
+  
+  protein_probe_results <- eventReactive(input$run_protein_probe, {
+    res <- downstream_results()
+    if (is.null(res) || is.null(res$hits_domain) || !nrow(res$hits_domain)) {
+      showNotification("Run sequence/domain summary first to populate protein consequences.", type = "warning")
+      return(NULL)
+    }
+    cons <- protein_consequences()
+    if (!nrow(cons)) return(NULL)
+    gene <- input$protein_probe_gene
+    evt_type <- input$protein_probe_event_type
+    evt <- input$protein_probe_event
+    if (!nzchar(gene)) {
+      showNotification("Select a gene for protein probing.", type = "warning")
+      return(NULL)
+    }
+    if (!nzchar(evt_type)) {
+      showNotification("Select an event type for protein probing.", type = "warning")
+      return(NULL)
+    }
+    allowed <- cons[gene_id == gene & event_type == evt_type, unique(event_id)]
+    if (!length(allowed)) {
+      showNotification("No protein consequences found for this gene and event type.", type = "warning")
+      return(NULL)
+    }
+    if (!nzchar(evt)) {
+      if (length(allowed) == 1) {
+        evt <- allowed
+      } else {
+        showNotification("Select an event ID to probe domains.", type = "warning")
+        return(NULL)
+      }
+    }
+    if (!evt %chin% allowed) {
+      showNotification("Pick an event present for this gene and event type.", type = "warning")
+      return(NULL)
+    }
+    
+    hd <- as.data.table(res$hits_domain)
+    hd_evt <- hd[event_id == evt & gene_id == gene & event_type == evt_type]
+    
+    hf <- as_dt_or_null(res$hits_final)
+    hf_evt <- NULL
+    if (!is.null(hf)) {
+      if (!"event_id" %in% names(hf)) hf[, event_id := NA_character_]
+      hf_evt <- hf[event_id == evt]
+    }
+    
+    cons_evt <- cons[event_id == evt & gene_id == gene & event_type == evt_type]
+    
+    build_probe_domains <- function(hd_dt) {
+      if (is.null(hd_dt) || !nrow(hd_dt)) return(data.table())
+      hd_dt <- as.data.table(hd_dt)
+      req_cols <- c("event_id", "event_type", "gene_id", "transcript_id_inc", "transcript_id_exc",
+                    "inc_only_domains_list", "exc_only_domains_list", "either_domains_list")
+      missing <- setdiff(req_cols, names(hd_dt))
+      if (length(missing)) {
+        showNotification(paste("hits_domain missing columns:", paste(missing, collapse = ", ")), type = "error")
+        return(data.table())
+      }
+      expand_dir <- function(list_col, tx_col, direction_label) {
+        out <- hd_dt[, .(
+          event_id, event_type, gene_id,
+          transcript_id = get(tx_col),
+          domain_vec = get(list_col)
+        )]
+        out <- out[!vapply(domain_vec, is.null, logical(1))]
+        out <- out[, .(domain_id = as.character(unlist(domain_vec, use.names = FALSE))), by = .(event_id, event_type, gene_id, transcript_id)]
+        out <- out[!is.na(domain_id) & nzchar(domain_id)]
+        out[, direction := direction_label]
+        out[]
+      }
+      inc_long    <- expand_dir("inc_only_domains_list", "transcript_id_inc", "inclusion")
+      exc_long    <- expand_dir("exc_only_domains_list", "transcript_id_exc", "exclusion")
+      shared_long <- expand_dir("either_domains_list",   "transcript_id_inc", "shared")
+      dom <- rbindlist(list(inc_long, exc_long, shared_long), use.names = TRUE, fill = TRUE)
+      if (!nrow(dom)) return(dom)
+      if ("name" %in% names(hd_dt) && "database" %in% names(hd_dt)) {
+        dom <- merge(dom, unique(hd_dt[, .(domain_id = name, database)]), by = "domain_id", all.x = TRUE)
+      }
+      dom[]
+    }
+    
+    dom_evt <- build_probe_domains(hd_evt)
+    if (nrow(dom_evt)) {
+      if ("database" %in% names(dom_evt)) dom_evt[, database := fifelse(is.na(database) | !nzchar(database), "domain", database)]
+    }
+    
+    list(
+      transcripts = if (!is.null(hf_evt) && nrow(hf_evt)) {
+        keep <- intersect(c("event_id", "event_type", "gene_id", "transcript_id_inc", "transcript_id_exc",
+                            "ensembl_peptide_id_inc", "ensembl_peptide_id_exc", "frame_category"), names(hf_evt))
+        hf_evt[, ..keep]
+      } else if (nrow(cons_evt)) {
+        cons_evt[, .(
+          transcripts = uniqueN(transcript_id)
+        ), by = .(direction)][order(direction)]
+      } else NULL,
+      domains = if (nrow(dom_evt)) dom_evt else cons_evt[, .(
+        transcript_id,
+        direction,
+        database,
+        name,
+        alt_name
+      )][order(direction, database, name)]
+    )
+  })
+  
+  output$protein_probe_tx_table <- renderTable({
+    res <- protein_probe_results()
+    if (is.null(res) || is.null(res$transcripts)) return(NULL)
+    res$transcripts
+  })
+  
+  output$protein_probe_domain_table <- renderTable({
+    res <- protein_probe_results()
+    if (is.null(res) || is.null(res$domains)) return(NULL)
+    res$domains[1:min(.N, 100)]
   })
   
   observeEvent(input$show_protein_table, {
@@ -1251,8 +1505,12 @@ server <- function(input, output, session) {
     res$plot
   })
   
-  hit_overview <- eventReactive(input$run_hit_overview + input$run_hit_overview_sidebar, {
+  hit_overview <- eventReactive(input$run_hit_overview, {
     req(rv$sample_frame, rv$splicing)
+    evt_type <- input$psi_overview_event_type
+    if (is.null(evt_type) || !nzchar(evt_type) || !evt_type %chin% c("AFE", "ALE")) {
+      evt_type <- "AFE"
+    }
     
     hc <- tryCatch(
       compare_hit_index(rv$sample_frame, condition_map = c(control = "control", test = "case")),
@@ -1260,7 +1518,7 @@ server <- function(input, output, session) {
     )
     
     ov <- tryCatch(
-      overview_splicing_comparison_fixed(rv$splicing, rv$sample_frame, depth_norm = "exon_files", event_type = "AFE"),
+      overview_splicing_comparison_fixed(rv$splicing, rv$sample_frame, depth_norm = "exon_files", event_type = evt_type),
       error = function(e) { showNotification(paste("overview_splicing_comparison_fixed failed:", e$message), type = "error"); NULL }
     )
     
@@ -1306,21 +1564,71 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "tx_a", choices = character(0), server = TRUE)
     updateSelectizeInput(session, "tx_b", choices = character(0), server = TRUE)
     updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE)
+    updateSelectizeInput(session, "protein_probe_gene", choices = gene_choices, server = TRUE)
+    updateSelectInput(session, "protein_probe_event_type", choices = character(0), selected = NULL)
+    updateSelectizeInput(session, "protein_probe_event", choices = character(0), server = TRUE)
   }, ignoreNULL = TRUE)
   
-  probe_choices <- reactive({
-    di_events <- if (!is.null(rv$di_norm)) unique(rv$di_norm$event_id) else character(0)
-    hit_events <- if (!is.null(rv$splicing)) unique(rv$splicing$event_id) else character(0)
-    choices <- intersect(di_events, hit_events)
-    if (!length(choices) && length(di_events)) choices <- di_events
-    sort(unique(choices))
+  probe_events_dt <- reactive({
+    if (is.null(rv$di_norm) || is.null(rv$splicing)) return(data.table())
+    di <- as.data.table(rv$di_norm)
+    sp <- as.data.table(rv$splicing)
+    if (!("event_id" %in% names(di)) || !("event_id" %in% names(sp))) return(data.table())
+    allowed <- intersect(unique(di$event_id), unique(sp$event_id))
+    if (!length(allowed)) return(data.table())
+    di_sub <- di[event_id %in% allowed, .(event_id, gene_id, event_type)]
+    sp_sub <- sp[event_id %in% allowed, .(event_id, gene_id, event_type)]
+    combined <- rbindlist(list(di_sub, sp_sub), use.names = TRUE, fill = TRUE)
+    unique(combined[!is.na(event_id) & !is.na(gene_id) & !is.na(event_type)])
   })
   
-  observeEvent(probe_choices(), {
-    choices <- probe_choices()
-    current <- isolate(input$probe_event)
-    selected <- if (!is.null(current) && nzchar(current) && current %chin% choices) current else NULL
-    updateSelectizeInput(session, "probe_event", choices = choices, server = TRUE, selected = selected)
+  observeEvent(probe_events_dt(), {
+    pe <- probe_events_dt()
+    gene_choices <- sort(unique(pe$gene_id))
+    current_gene <- isolate(input$probe_gene)
+    selected_gene <- if (!is.null(current_gene) && nzchar(current_gene) && current_gene %chin% gene_choices) current_gene else NULL
+    updateSelectizeInput(session, "probe_gene", choices = gene_choices, server = TRUE, selected = selected_gene)
+    if (is.null(selected_gene)) {
+      updateSelectInput(session, "probe_event_type", choices = character(0), selected = NULL)
+      updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE, selected = NULL)
+    } else {
+      types <- sort(unique(pe[gene_id == selected_gene, event_type]))
+      current_type <- isolate(input$probe_event_type)
+      selected_type <- if (!is.null(current_type) && nzchar(current_type) && current_type %chin% types) current_type else if (length(types)) types[1] else NULL
+      updateSelectInput(session, "probe_event_type", choices = types, selected = selected_type)
+    }
+  })
+  
+  observeEvent(input$probe_gene, {
+    pe <- probe_events_dt()
+    if (!nrow(pe) || !nzchar(input$probe_gene)) {
+      updateSelectInput(session, "probe_event_type", choices = character(0), selected = NULL)
+      updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    types <- sort(unique(pe[gene_id == input$probe_gene, event_type]))
+    current_type <- isolate(input$probe_event_type)
+    selected_type <- if (!is.null(current_type) && nzchar(current_type) && current_type %chin% types) current_type else if (length(types)) types[1] else NULL
+    updateSelectInput(session, "probe_event_type", choices = types, selected = selected_type)
+  }, ignoreInit = TRUE)
+  
+  observeEvent(list(input$probe_gene, input$probe_event_type), {
+    pe <- probe_events_dt()
+    gene <- input$probe_gene
+    evt_type <- input$probe_event_type
+    if (!nrow(pe) || !nzchar(gene) || !nzchar(evt_type)) {
+      updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    event_choices <- sort(unique(pe[gene_id == gene & event_type == evt_type, event_id]))
+    current_evt <- isolate(input$probe_event)
+    selected_evt <- if (!is.null(current_evt) && nzchar(current_evt) && current_evt %chin% event_choices) current_evt else NULL
+    if (length(event_choices) == 1 && is.null(selected_evt)) selected_evt <- event_choices
+    if (evt_type %chin% c("AFE", "ALE")) {
+      updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE, selected = NULL)
+    } else {
+      updateSelectizeInput(session, "probe_event", choices = event_choices, server = TRUE, selected = selected_evt)
+    }
   }, ignoreInit = TRUE)
   
   observeEvent(input$pair_gene, {
@@ -1331,17 +1639,96 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "tx_b", choices = tx_choices, server = TRUE, selected = NULL)
   }, ignoreInit = TRUE)
   
+  protein_probe_events_dt <- reactive({
+    cons <- protein_consequences()
+    if (is.null(cons) || !nrow(cons)) return(data.table())
+    cons[, .(event_id, gene_id, event_type)][
+      !is.na(event_id) & nzchar(event_id) & !is.na(gene_id) & nzchar(gene_id) & !is.na(event_type) & nzchar(event_type)][
+        , unique(.SD)]
+  })
+  
+  observeEvent(protein_probe_events_dt(), {
+    pe <- protein_probe_events_dt()
+    gene_choices <- sort(unique(pe$gene_id))
+    current_gene <- isolate(input$protein_probe_gene)
+    selected_gene <- if (!is.null(current_gene) && nzchar(current_gene) && current_gene %chin% gene_choices) current_gene else NULL
+    updateSelectizeInput(session, "protein_probe_gene", choices = gene_choices, server = TRUE, selected = selected_gene)
+    if (is.null(selected_gene)) {
+      updateSelectInput(session, "protein_probe_event_type", choices = character(0), selected = NULL)
+      updateSelectizeInput(session, "protein_probe_event", choices = character(0), server = TRUE, selected = NULL)
+    } else {
+      types <- sort(unique(pe[gene_id == selected_gene, event_type]))
+      current_type <- isolate(input$protein_probe_event_type)
+      selected_type <- if (!is.null(current_type) && nzchar(current_type) && current_type %chin% types) current_type else if (length(types)) types[1] else NULL
+      updateSelectInput(session, "protein_probe_event_type", choices = types, selected = selected_type)
+    }
+  })
+  
+  observeEvent(input$protein_probe_gene, {
+    pe <- protein_probe_events_dt()
+    if (!nrow(pe) || !nzchar(input$protein_probe_gene)) {
+      updateSelectInput(session, "protein_probe_event_type", choices = character(0), selected = NULL)
+      updateSelectizeInput(session, "protein_probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    types <- sort(unique(pe[gene_id == input$protein_probe_gene, event_type]))
+    current_type <- isolate(input$protein_probe_event_type)
+    selected_type <- if (!is.null(current_type) && nzchar(current_type) && current_type %chin% types) current_type else if (length(types)) types[1] else NULL
+    updateSelectInput(session, "protein_probe_event_type", choices = types, selected = selected_type)
+  }, ignoreInit = TRUE)
+  
+  observeEvent(list(input$protein_probe_gene, input$protein_probe_event_type), {
+    pe <- protein_probe_events_dt()
+    gene <- input$protein_probe_gene
+    evt_type <- input$protein_probe_event_type
+    if (!nrow(pe) || !nzchar(gene) || !nzchar(evt_type)) {
+      updateSelectizeInput(session, "protein_probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    event_choices <- sort(unique(pe[gene_id == gene & event_type == evt_type, event_id]))
+    current_evt <- isolate(input$protein_probe_event)
+    selected_evt <- if (!is.null(current_evt) && nzchar(current_evt) && current_evt %chin% event_choices) current_evt else NULL
+    if (length(event_choices) == 1 && is.null(selected_evt)) selected_evt <- event_choices
+    updateSelectizeInput(session, "protein_probe_event", choices = event_choices, server = TRUE, selected = selected_evt)
+  }, ignoreInit = TRUE)
+  
   probe_event_plot <- eventReactive(input$run_probe, {
     req(rv$di_norm, rv$splicing)
-    evt <- input$probe_event
-    if (!nzchar(evt)) {
-      showNotification("Select an event ID to probe.", type = "warning")
+    pe <- probe_events_dt()
+    if (!nrow(pe)) {
+      showNotification("No overlapping events between DI results and splicing table.", type = "warning")
       return(NULL)
     }
-    allowed <- intersect(unique(rv$di_norm$event_id), unique(rv$splicing$event_id))
-    if (!evt %chin% allowed) {
-      showNotification("Pick an event present in both DI results and the splicing table.", type = "warning")
+    gene <- input$probe_gene
+    evt_type <- input$probe_event_type
+    if (!nzchar(gene)) {
+      showNotification("Select a gene to probe.", type = "warning")
       return(NULL)
+    }
+    if (!nzchar(evt_type)) {
+      showNotification("Select an event type to probe.", type = "warning")
+      return(NULL)
+    }
+    candidates <- pe[gene_id == gene & event_type == evt_type, unique(event_id)]
+    if (!length(candidates)) {
+      showNotification("No events found for the selected gene and event type.", type = "warning")
+      return(NULL)
+    }
+    evt <- input$probe_event
+    if (evt_type %chin% c("AFE", "ALE")) {
+      evt <- candidates[1]
+    } else {
+      if (!nzchar(evt) && length(candidates) == 1) {
+        evt <- candidates
+      }
+      if (!nzchar(evt)) {
+        showNotification("Select an event ID for this gene and event type.", type = "warning")
+        return(NULL)
+      }
+      if (!evt %chin% candidates) {
+        showNotification("Pick an event present for this gene and event type.", type = "warning")
+        return(NULL)
+      }
     }
     tryCatch(
       probe_individual_event(rv$splicing, event = evt),
