@@ -199,6 +199,12 @@ ui <- fluidPage(
           "Protein consequences",
           textInput("prot_gene_filter", "Gene filter (protein tab)", value = "", placeholder = "Overrides global gene filter"),
           helpText("Run sequence/domain plots after loading proteins to summarize inclusion vs. exclusion domain changes."),
+          h5("Probe domains by event"),
+          helpText("Select gene → event type → event to list affected transcripts and domains."),
+          selectizeInput("protein_probe_gene", "Gene", choices = NULL, options = list(placeholder = "Select gene")),
+          selectInput("protein_probe_event_type", "Event type", choices = c(""), selected = NULL),
+          selectizeInput("protein_probe_event", "Event ID", choices = NULL, options = list(placeholder = "Select event_id")),
+          actionButton("run_protein_probe", "Probe protein consequences", width = "100%"),
           plotOutput("protein_plot", height = 350),
           h4("Domain overlaps with inclusion exons"),
           tableOutput("protein_summary"),
@@ -207,6 +213,9 @@ ui <- fluidPage(
           helpText("When a single gene with exactly two transcripts is selected, shows shared vs. unique domains by database."),
           tableOutput("protein_pair_summary"),
           tableOutput("protein_pair_detail"),
+          h4("Event transcripts and domains"),
+          tableOutput("protein_probe_tx_table"),
+          tableOutput("protein_probe_domain_table"),
           actionButton("show_protein_table", "Show full protein consequence table")
         ),
         tabPanel(
@@ -965,6 +974,71 @@ server <- function(input, output, session) {
     ][1:min(.N, 100)]
   })
   
+  protein_probe_results <- eventReactive(input$run_protein_probe, {
+    cons <- protein_consequences()
+    if (!nrow(cons)) {
+      showNotification("Run sequence/domain summary first to populate protein consequences.", type = "warning")
+      return(NULL)
+    }
+    gene <- input$protein_probe_gene
+    evt_type <- input$protein_probe_event_type
+    evt <- input$protein_probe_event
+    if (!nzchar(gene)) {
+      showNotification("Select a gene for protein probing.", type = "warning")
+      return(NULL)
+    }
+    if (!nzchar(evt_type)) {
+      showNotification("Select an event type for protein probing.", type = "warning")
+      return(NULL)
+    }
+    allowed <- cons[gene_id == gene & event_type == evt_type, unique(event_id)]
+    if (!length(allowed)) {
+      showNotification("No protein consequences found for this gene and event type.", type = "warning")
+      return(NULL)
+    }
+    if (!nzchar(evt)) {
+      if (length(allowed) == 1) {
+        evt <- allowed
+      } else {
+        showNotification("Select an event ID to probe domains.", type = "warning")
+        return(NULL)
+      }
+    }
+    if (!evt %chin% allowed) {
+      showNotification("Pick an event present for this gene and event type.", type = "warning")
+      return(NULL)
+    }
+    cons_evt <- cons[event_id == evt & gene_id == gene & event_type == evt_type]
+    if (!nrow(cons_evt)) {
+      showNotification("No protein consequence rows for this event.", type = "warning")
+      return(NULL)
+    }
+    list(
+      transcripts = cons_evt[, .(
+        transcripts = uniqueN(transcript_id)
+      ), by = .(direction)][order(direction)],
+      domains = cons_evt[, .(
+        transcript_id,
+        direction,
+        database,
+        name,
+        alt_name
+      )][order(direction, database, name)]
+    )
+  })
+  
+  output$protein_probe_tx_table <- renderTable({
+    res <- protein_probe_results()
+    if (is.null(res) || is.null(res$transcripts)) return(NULL)
+    res$transcripts
+  })
+  
+  output$protein_probe_domain_table <- renderTable({
+    res <- protein_probe_results()
+    if (is.null(res) || is.null(res$domains)) return(NULL)
+    res$domains[1:min(.N, 100)]
+  })
+  
   observeEvent(input$show_protein_table, {
     cons <- protein_consequences()
     req(nrow(cons))
@@ -1436,6 +1510,9 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "tx_a", choices = character(0), server = TRUE)
     updateSelectizeInput(session, "tx_b", choices = character(0), server = TRUE)
     updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE)
+    updateSelectizeInput(session, "protein_probe_gene", choices = gene_choices, server = TRUE)
+    updateSelectInput(session, "protein_probe_event_type", choices = character(0), selected = NULL)
+    updateSelectizeInput(session, "protein_probe_event", choices = character(0), server = TRUE)
   }, ignoreNULL = TRUE)
   
   probe_events_dt <- reactive({
@@ -1506,6 +1583,59 @@ server <- function(input, output, session) {
     tx_choices <- ann[type == "transcript" & gene_id == input$pair_gene, unique(transcript_id)]
     updateSelectizeInput(session, "tx_a", choices = tx_choices, server = TRUE, selected = NULL)
     updateSelectizeInput(session, "tx_b", choices = tx_choices, server = TRUE, selected = NULL)
+  }, ignoreInit = TRUE)
+  
+  protein_probe_events_dt <- reactive({
+    cons <- protein_consequences()
+    if (is.null(cons) || !nrow(cons)) return(data.table())
+    cons[, .(event_id, gene_id, event_type)][
+      !is.na(event_id) & nzchar(event_id) & !is.na(gene_id) & nzchar(gene_id) & !is.na(event_type) & nzchar(event_type)][
+        , unique(.SD)]
+  })
+  
+  observeEvent(protein_probe_events_dt(), {
+    pe <- protein_probe_events_dt()
+    gene_choices <- sort(unique(pe$gene_id))
+    current_gene <- isolate(input$protein_probe_gene)
+    selected_gene <- if (!is.null(current_gene) && nzchar(current_gene) && current_gene %chin% gene_choices) current_gene else NULL
+    updateSelectizeInput(session, "protein_probe_gene", choices = gene_choices, server = TRUE, selected = selected_gene)
+    if (is.null(selected_gene)) {
+      updateSelectInput(session, "protein_probe_event_type", choices = character(0), selected = NULL)
+      updateSelectizeInput(session, "protein_probe_event", choices = character(0), server = TRUE, selected = NULL)
+    } else {
+      types <- sort(unique(pe[gene_id == selected_gene, event_type]))
+      current_type <- isolate(input$protein_probe_event_type)
+      selected_type <- if (!is.null(current_type) && nzchar(current_type) && current_type %chin% types) current_type else if (length(types)) types[1] else NULL
+      updateSelectInput(session, "protein_probe_event_type", choices = types, selected = selected_type)
+    }
+  })
+  
+  observeEvent(input$protein_probe_gene, {
+    pe <- protein_probe_events_dt()
+    if (!nrow(pe) || !nzchar(input$protein_probe_gene)) {
+      updateSelectInput(session, "protein_probe_event_type", choices = character(0), selected = NULL)
+      updateSelectizeInput(session, "protein_probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    types <- sort(unique(pe[gene_id == input$protein_probe_gene, event_type]))
+    current_type <- isolate(input$protein_probe_event_type)
+    selected_type <- if (!is.null(current_type) && nzchar(current_type) && current_type %chin% types) current_type else if (length(types)) types[1] else NULL
+    updateSelectInput(session, "protein_probe_event_type", choices = types, selected = selected_type)
+  }, ignoreInit = TRUE)
+  
+  observeEvent(list(input$protein_probe_gene, input$protein_probe_event_type), {
+    pe <- protein_probe_events_dt()
+    gene <- input$protein_probe_gene
+    evt_type <- input$protein_probe_event_type
+    if (!nrow(pe) || !nzchar(gene) || !nzchar(evt_type)) {
+      updateSelectizeInput(session, "protein_probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    event_choices <- sort(unique(pe[gene_id == gene & event_type == evt_type, event_id]))
+    current_evt <- isolate(input$protein_probe_event)
+    selected_evt <- if (!is.null(current_evt) && nzchar(current_evt) && current_evt %chin% event_choices) current_evt else NULL
+    if (length(event_choices) == 1 && is.null(selected_evt)) selected_evt <- event_choices
+    updateSelectizeInput(session, "protein_probe_event", choices = event_choices, server = TRUE, selected = selected_evt)
   }, ignoreInit = TRUE)
   
   probe_event_plot <- eventReactive(input$run_probe, {
