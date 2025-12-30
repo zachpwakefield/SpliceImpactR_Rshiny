@@ -34,7 +34,49 @@ demo_sample_frame <- function() {
     stringsAsFactors = FALSE
   )
 }
-
+build_domain_diffs <- function(hits_domain_dt) {
+  hd <- data.table::as.data.table(hits_domain_dt)
+  
+  req_cols <- c(
+    "event_id", "event_type_inc", "gene_id_inc",
+    "transcript_id_inc", "transcript_id_exc",
+    "inc_only_domains_list", "exc_only_domains_list", "either_domains_list"
+  )
+  missing <- setdiff(req_cols, names(hd))
+  if (length(missing)) stop("hits_domain missing columns: ", paste(missing, collapse = ", "))
+  
+  # Ensure list-cols exist and are lists of character vectors (not NULL)
+  for (lc in c("inc_only_domains_list", "exc_only_domains_list", "either_domains_list")) {
+    if (!lc %in% names(hd)) hd[, (lc) := vector("list", .N)]
+    hd[, (lc) := lapply(get(lc), function(x) {
+      if (is.null(x) || length(x) == 0L) character()
+      else as.character(x)
+    })]
+  }
+  
+  mk_long <- function(list_col, change_label) {
+    # Expand per-row list into long rows safely
+    out <- hd[, .(
+      event_id,
+      event_type = event_type_inc,
+      gene_id    = gene_id_inc,
+      transcript_inc = transcript_id_inc,
+      transcript_exc = transcript_id_exc,
+      domain = unlist(get(list_col), use.names = FALSE)
+    ), by = .I]
+    
+    out <- out[!is.na(domain) & nzchar(domain)]
+    out[, change := change_label]
+    out
+  }
+  
+  
+  rbindlist(list(
+    mk_long("inc_only_domains_list", "gained"),
+    mk_long("exc_only_domains_list", "lost"),
+    mk_long("either_domains_list",   "either inclusion or exclusion")
+  ), use.names = TRUE, fill = TRUE)
+}
 supported_events <- c("ALE", "AFE", "MXE", "SE", "A3SS", "A5SS", "RI")
 
 ui <- fluidPage(
@@ -862,23 +904,39 @@ server <- function(input, output, session) {
   })
   
   protein_consequences <- reactive({
-    res <- tryCatch(
-      downstream_results(),
-      error = function(e) {
-        showNotification(paste("Downstream results error:", e$message), type = "error")
-        NULL
-      }
-    )
-    if (is.null(res) || is.null(res$domain_long) || !nrow(res$domain_long)) {
+    res <- downstream_results()
+    if (is.null(res) || is.null(res$hits_domain) || !nrow(res$hits_domain)) {
       return(data.table())
     }
-    dt <- as.data.table(res$domain_long)
-    needed <- c("event_id", "event_type", "gene_id", "transcript_id", "direction", "domain_id", "database", "name", "alt_name")
-    missing_cols <- setdiff(needed, names(dt))
-    if (length(missing_cols)) dt[, (missing_cols) := NA_character_]
-    out <- dt[, ..needed]
-    for (col in needed) set(out, j = col, value = as.character(out[[col]]))
-    as.data.table(out)
+    
+    dom <- build_domain_diffs(res$hits_domain)
+    
+    # Parse "database;name|..." style if present
+    parsed <- data.table::tstrsplit(dom$domain, ";", fixed = TRUE)
+    if (length(parsed) >= 2) {
+      dom[, `:=`(
+        database = parsed[[1]],
+        name     = parsed[[2]]
+      )]
+    } else {
+      dom[, `:=`(
+        database = "unlabeled",
+        name     = domain
+      )]
+    }
+    
+    dom[, alt_name := ""]
+    dom[, domain_id := domain]
+    
+    # Compatibility shim for existing plotting code
+    dom[, direction := change]
+    
+    dom[, .(
+      event_id, event_type, gene_id,
+      transcript_id = transcript_inc,  # keep one transcript_id column if you want old behavior
+      transcript_inc, transcript_exc,
+      direction, domain_id, database, name, alt_name
+    )]
   })
   
   output$protein_plot <- renderPlot({
@@ -1051,8 +1109,7 @@ server <- function(input, output, session) {
       }
       inc_long    <- expand_dir("inc_only_domains_list", "transcript_id_inc", "inclusion")
       exc_long    <- expand_dir("exc_only_domains_list", "transcript_id_exc", "exclusion")
-      shared_long <- expand_dir("either_domains_list",   "transcript_id_inc", "shared")
-      dom <- rbindlist(list(inc_long, exc_long, shared_long), use.names = TRUE, fill = TRUE)
+      dom <- rbindlist(list(inc_long, exc_long), use.names = TRUE, fill = TRUE)
       if (!nrow(dom)) return(dom)
       if ("name" %in% names(hd_dt) && "database" %in% names(hd_dt)) {
         dom <- merge(dom, unique(hd_dt[, .(domain_id = name, database)]), by = "domain_id", all.x = TRUE)
@@ -1644,6 +1701,7 @@ server <- function(input, output, session) {
       !is.na(event_id) & nzchar(event_id) & !is.na(gene_id) & nzchar(gene_id) & !is.na(event_type) & nzchar(event_type)][
         , unique(.SD)]
   })
+  
   
   observeEvent(protein_probe_events_dt(), {
     pe <- protein_probe_events_dt()
