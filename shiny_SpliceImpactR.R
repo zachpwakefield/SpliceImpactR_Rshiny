@@ -77,6 +77,14 @@ ui <- fluidPage(
       hr(),
       h4("Protein features"),
       checkboxInput("use_demo_proteins", "Use bundled InterPro/SignalP demo domains", value = TRUE),
+      selectizeInput(
+        "biomart_features",
+        "Biomart protein features",
+        choices = c("interpro", "signalp", "seg", "ncoils", "mobidblite", "tmhmm"),
+        selected = c("interpro", "signalp"),
+        multiple = TRUE,
+        options = list(plugins = list("remove_button"))
+      ),
       fileInput("protein_file", "Upload protein features (RDS/CSV)", accept = c(".rds", ".csv", ".tsv")),
       actionButton("load_proteins", "Load protein features", width = "100%"),
       hr(),
@@ -94,6 +102,7 @@ ui <- fluidPage(
       numericInput("min_reads", "Minimum total reads per site/sample", value = 10, min = 0),
       numericInput("padj_thr", "FDR cutoff", value = 0.05, min = 0, step = 0.01),
       numericInput("dpsi_thr", "|Delta PSI| cutoff", value = 0.1, min = 0, step = 0.01),
+      textInput("cooks_cutoff", "Cooks cutoff", value = "4/n"),
       actionButton("run_di", "Run differential inclusion", width = "100%"),
       hr(),
       h4("Annotation mapping"),
@@ -163,6 +172,8 @@ ui <- fluidPage(
           "Status",
           h4("Annotation status"),
           tableOutput("annotation_summary"),
+          h4("Active parameters"),
+          tableOutput("parameter_summary"),
           h4("Splicing inputs"),
           tableOutput("sample_preview"),
           h4("Event counts"),
@@ -497,9 +508,16 @@ server <- function(input, output, session) {
       rv$sample_frame <- manifest
       
       incProgress(0.35, detail = "Proteins (demo InterPro/SignalP)")
-      interpro_features <- get_protein_features(c("interpro"), ann$annotations, test = TRUE)
-      signalp_features <- get_protein_features(c("signalp"), ann$annotations, test = TRUE)
-      pf <- get_comprehensive_annotations(list(signalp_features, interpro_features))
+      bm_features <- intersect(input$biomart_features, c("interpro", "signalp", "seg", "ncoils", "mobidblite", "tmhmm"))
+      if (!length(bm_features)) bm_features <- c("interpro", "signalp")
+      dataset <- if (identical(input$annotation_species, "mouse")) "mmusculus_gene_ensembl" else "hsapiens_gene_ensembl"
+      pf <- get_protein_features(
+        biomaRt_databases = bm_features,
+        gtf_df = ann$annotations,
+        species_dataset = dataset,
+        release = input$annotation_release,
+        test = TRUE
+      )
       pf_dt <- as.data.table(pf)
       if (!"ensembl_transcript_id" %in% names(pf_dt) && "transcript_id" %in% names(pf_dt)) {
         pf_dt[, ensembl_transcript_id := transcript_id]
@@ -522,7 +540,7 @@ server <- function(input, output, session) {
       rv$di <- get_differential_inclusion(
         rv$splicing,
         min_total_reads = input$min_reads,
-        cooks_cutoff = "4/n",
+        cooks_cutoff = input$cooks_cutoff,
         parallel_glm = FALSE,
         verbose = FALSE
       )
@@ -591,18 +609,18 @@ server <- function(input, output, session) {
     req(rv$annotations)
     withProgress(message = "Loading protein features", value = 0, {
       pf <- NULL
+      bm_features <- intersect(input$biomart_features, c("interpro", "signalp", "seg", "ncoils", "mobidblite", "tmhmm"))
+      dataset <- if (identical(input$annotation_species, "mouse")) "mmusculus_gene_ensembl" else "hsapiens_gene_ensembl"
+      
       if (isTruthy(input$use_demo_proteins)) {
-        interpro_features <- get_protein_features(
-          biomaRt_databases = c("interpro"),
+        if (!length(bm_features)) bm_features <- c("interpro", "signalp")
+        pf <- get_protein_features(
+          biomaRt_databases = bm_features,
           gtf_df = rv$annotations$annotations,
+          species_dataset = dataset,
+          release = input$annotation_release,
           test = TRUE
         )
-        signalp_features <- get_protein_features(
-          biomaRt_databases = c("signalp"),
-          gtf_df = rv$annotations$annotations,
-          test = TRUE
-        )
-        pf <- get_comprehensive_annotations(list(signalp_features, interpro_features))
       }
       
       if (!is.null(input$protein_file)) {
@@ -613,6 +631,16 @@ server <- function(input, output, session) {
           delim <- if (ext == "tsv") "\t" else ","
           fread(input$protein_file$datapath, sep = delim, data.table = TRUE)
         }
+      }
+      
+      if (is.null(pf) && length(bm_features)) {
+        pf <- get_protein_features(
+          biomaRt_databases = bm_features,
+          gtf_df = rv$annotations$annotations,
+          species_dataset = dataset,
+          release = input$annotation_release,
+          test = FALSE
+        )
       }
       
       validate(need(!is.null(pf), "Provide a protein feature file or enable demo domains."))
@@ -667,7 +695,7 @@ server <- function(input, output, session) {
       di <- get_differential_inclusion(
         rv$splicing,
         min_total_reads = input$min_reads,
-        cooks_cutoff = "4/n",
+        cooks_cutoff = input$cooks_cutoff,
         parallel_glm = FALSE,
         verbose = FALSE
       )
@@ -701,6 +729,44 @@ server <- function(input, output, session) {
     )
   })
   
+  output$parameter_summary <- renderTable({
+    ann_mode <- input$annotation_mode
+    features <- input$biomart_features
+    data.frame(
+      Parameter = c(
+        "Annotation mode",
+        "Species",
+        "Annotation release",
+        "rMATS counts",
+        "Event types",
+        "Keep annotated first/last",
+        "Minimum reads",
+        "Cooks cutoff",
+        "FDR cutoff",
+        "|Delta PSI| cutoff",
+        "Biomart protein features",
+        "Demo protein features",
+        "Demo PPIs"
+      ),
+      Value = c(
+        if (nzchar(ann_mode)) ann_mode else "not set",
+        if (nzchar(input$annotation_species)) input$annotation_species else "not set",
+        if (!is.null(input$annotation_release)) input$annotation_release else "not set",
+        if (nzchar(input$rmats_use)) input$rmats_use else "not set",
+        paste(input$event_types, collapse = ", "),
+        if (isTRUE(input$keep_first_last)) "Yes" else "No",
+        input$min_reads,
+        input$cooks_cutoff,
+        input$padj_thr,
+        input$dpsi_thr,
+        if (length(features)) paste(features, collapse = ", ") else "not set",
+        if (isTRUE(input$use_demo_proteins)) "Demo InterPro/SignalP" else "User provided",
+        if (isTRUE(input$use_demo_ppi)) "Demo PPIDM" else "Downloaded/none"
+      ),
+      stringsAsFactors = FALSE
+    )
+  })
+  
   output$sample_preview <- renderTable({
     if (is.null(rv$sample_frame)) return(NULL)
     head(rv$sample_frame, 10)
@@ -727,7 +793,7 @@ server <- function(input, output, session) {
   
   output$di_table <- renderTable({
     req(rv$di_norm)
-    sig <- rv$di_norm
+    sig <- copy(rv$di_norm)
     if (is.null(sig)) {
       showNotification("Differential inclusion results missing padj or delta_psi.", type = "error")
       return(NULL)
@@ -735,6 +801,8 @@ server <- function(input, output, session) {
     sig <- sig[is.finite(padj) & padj <= input$padj_thr &
                  is.finite(delta_psi) & abs(delta_psi) >= input$dpsi_thr]
     sig <- apply_filters(sig, gene_col = "gene_id", gene_override = input$di_gene_filter)
+    if ("padj" %in% names(sig)) sig[, padj := signif(padj, 4)]
+    if ("delta_psi" %in% names(sig)) sig[, delta_psi := signif(delta_psi, 4)]
     sig[order(padj)][1:min(.N, 25)]
   })
   
