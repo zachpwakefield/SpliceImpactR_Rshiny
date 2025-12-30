@@ -1012,13 +1012,17 @@ server <- function(input, output, session) {
     }
     
     hd <- as.data.table(res$hits_domain)
-    hd_evt <- hd[event_id == evt & gene_id == gene & event_type == evt_type]
+    hd_evt <- hd[event_id == evt & event_type == evt_type & (gene_id_inc == gene | gene_id_exc == gene | gene_id == gene)]
     
     hf <- as_dt_or_null(res$hits_final)
     hf_evt <- NULL
     if (!is.null(hf)) {
       if (!"event_id" %in% names(hf)) hf[, event_id := NA_character_]
+      gene_cols <- intersect(c("gene_id_inc", "gene_id_exc", "gene_id"), names(hf))
       hf_evt <- hf[event_id == evt]
+      if (length(gene_cols)) {
+        hf_evt <- hf_evt[Reduce(`|`, lapply(gene_cols, function(gc) hf_evt[[gc]] == gene))]
+      }
     }
     
     cons_evt <- cons[event_id == evt & gene_id == gene & event_type == evt_type]
@@ -1071,13 +1075,7 @@ server <- function(input, output, session) {
           transcripts = uniqueN(transcript_id)
         ), by = .(direction)][order(direction)]
       } else NULL,
-      domains = if (nrow(dom_evt)) dom_evt else cons_evt[, .(
-        transcript_id,
-        direction,
-        database,
-        name,
-        alt_name
-      )][order(direction, database, name)]
+      domains = if (nrow(dom_evt)) dom_evt else data.table()
     )
   })
   
