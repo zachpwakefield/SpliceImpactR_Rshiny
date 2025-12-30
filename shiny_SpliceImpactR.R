@@ -975,11 +975,13 @@ server <- function(input, output, session) {
   })
   
   protein_probe_results <- eventReactive(input$run_protein_probe, {
-    cons <- protein_consequences()
-    if (!nrow(cons)) {
+    res <- downstream_results()
+    if (is.null(res) || is.null(res$hits_domain) || !nrow(res$hits_domain)) {
       showNotification("Run sequence/domain summary first to populate protein consequences.", type = "warning")
       return(NULL)
     }
+    cons <- protein_consequences()
+    if (!nrow(cons)) return(NULL)
     gene <- input$protein_probe_gene
     evt_type <- input$protein_probe_event_type
     evt <- input$protein_probe_event
@@ -1008,16 +1010,68 @@ server <- function(input, output, session) {
       showNotification("Pick an event present for this gene and event type.", type = "warning")
       return(NULL)
     }
-    cons_evt <- cons[event_id == evt & gene_id == gene & event_type == evt_type]
-    if (!nrow(cons_evt)) {
-      showNotification("No protein consequence rows for this event.", type = "warning")
-      return(NULL)
+    
+    hd <- as.data.table(res$hits_domain)
+    hd_evt <- hd[event_id == evt & gene_id == gene & event_type == evt_type]
+    
+    hf <- as_dt_or_null(res$hits_final)
+    hf_evt <- NULL
+    if (!is.null(hf)) {
+      if (!"event_id" %in% names(hf)) hf[, event_id := NA_character_]
+      hf_evt <- hf[event_id == evt]
     }
+    
+    cons_evt <- cons[event_id == evt & gene_id == gene & event_type == evt_type]
+    
+    build_probe_domains <- function(hd_dt) {
+      if (is.null(hd_dt) || !nrow(hd_dt)) return(data.table())
+      hd_dt <- as.data.table(hd_dt)
+      req_cols <- c("event_id", "event_type", "gene_id", "transcript_id_inc", "transcript_id_exc",
+                    "inc_only_domains_list", "exc_only_domains_list", "either_domains_list")
+      missing <- setdiff(req_cols, names(hd_dt))
+      if (length(missing)) {
+        showNotification(paste("hits_domain missing columns:", paste(missing, collapse = ", ")), type = "error")
+        return(data.table())
+      }
+      expand_dir <- function(list_col, tx_col, direction_label) {
+        out <- hd_dt[, .(
+          event_id, event_type, gene_id,
+          transcript_id = get(tx_col),
+          domain_vec = get(list_col)
+        )]
+        out <- out[!vapply(domain_vec, is.null, logical(1))]
+        out <- out[, .(domain_id = as.character(unlist(domain_vec, use.names = FALSE))), by = .(event_id, event_type, gene_id, transcript_id)]
+        out <- out[!is.na(domain_id) & nzchar(domain_id)]
+        out[, direction := direction_label]
+        out[]
+      }
+      inc_long    <- expand_dir("inc_only_domains_list", "transcript_id_inc", "inclusion")
+      exc_long    <- expand_dir("exc_only_domains_list", "transcript_id_exc", "exclusion")
+      shared_long <- expand_dir("either_domains_list",   "transcript_id_inc", "shared")
+      dom <- rbindlist(list(inc_long, exc_long, shared_long), use.names = TRUE, fill = TRUE)
+      if (!nrow(dom)) return(dom)
+      if ("name" %in% names(hd_dt) && "database" %in% names(hd_dt)) {
+        dom <- merge(dom, unique(hd_dt[, .(domain_id = name, database)]), by = "domain_id", all.x = TRUE)
+      }
+      dom[]
+    }
+    
+    dom_evt <- build_probe_domains(hd_evt)
+    if (nrow(dom_evt)) {
+      if ("database" %in% names(dom_evt)) dom_evt[, database := fifelse(is.na(database) | !nzchar(database), "domain", database)]
+    }
+    
     list(
-      transcripts = cons_evt[, .(
-        transcripts = uniqueN(transcript_id)
-      ), by = .(direction)][order(direction)],
-      domains = cons_evt[, .(
+      transcripts = if (!is.null(hf_evt) && nrow(hf_evt)) {
+        keep <- intersect(c("event_id", "event_type", "gene_id", "transcript_id_inc", "transcript_id_exc",
+                            "ensembl_peptide_id_inc", "ensembl_peptide_id_exc", "frame_category"), names(hf_evt))
+        hf_evt[, ..keep]
+      } else if (nrow(cons_evt)) {
+        cons_evt[, .(
+          transcripts = uniqueN(transcript_id)
+        ), by = .(direction)][order(direction)]
+      } else NULL,
+      domains = if (nrow(dom_evt)) dom_evt else cons_evt[, .(
         transcript_id,
         direction,
         database,
