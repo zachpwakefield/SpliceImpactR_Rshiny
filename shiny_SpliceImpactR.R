@@ -510,11 +510,10 @@ server <- function(input, output, session) {
       incProgress(0.35, detail = "Proteins (demo InterPro/SignalP)")
       bm_features <- intersect(input$biomart_features, c("interpro", "signalp", "seg", "ncoils", "mobidblite", "tmhmm"))
       if (!length(bm_features)) bm_features <- c("interpro", "signalp")
-      dataset <- if (identical(input$annotation_species, "mouse")) "mmusculus_gene_ensembl" else "hsapiens_gene_ensembl"
       pf <- get_protein_features(
         biomaRt_databases = bm_features,
         gtf_df = ann$annotations,
-        species_dataset = dataset,
+        species = input$annotation_species,
         release = input$annotation_release,
         test = TRUE
       )
@@ -610,14 +609,13 @@ server <- function(input, output, session) {
     withProgress(message = "Loading protein features", value = 0, {
       pf <- NULL
       bm_features <- intersect(input$biomart_features, c("interpro", "signalp", "seg", "ncoils", "mobidblite", "tmhmm"))
-      dataset <- if (identical(input$annotation_species, "mouse")) "mmusculus_gene_ensembl" else "hsapiens_gene_ensembl"
       
       if (isTruthy(input$use_demo_proteins)) {
         if (!length(bm_features)) bm_features <- c("interpro", "signalp")
         pf <- get_protein_features(
           biomaRt_databases = bm_features,
           gtf_df = rv$annotations$annotations,
-          species_dataset = dataset,
+          species = input$annotation_species,
           release = input$annotation_release,
           test = TRUE
         )
@@ -637,7 +635,7 @@ server <- function(input, output, session) {
         pf <- get_protein_features(
           biomaRt_databases = bm_features,
           gtf_df = rv$annotations$annotations,
-          species_dataset = dataset,
+          species = input$annotation_species,
           release = input$annotation_release,
           test = FALSE
         )
