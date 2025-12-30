@@ -1012,7 +1012,7 @@ server <- function(input, output, session) {
     }
     
     hd <- as.data.table(res$hits_domain)
-    hd_evt <- hd[event_id == evt & event_type == evt_type & (gene_id_inc == gene | gene_id_exc == gene | gene_id == gene)]
+    hd_evt <- hd[event_id == evt & event_type_inc == evt_type & gene_id_inc == gene]
     
     hf <- as_dt_or_null(res$hits_final)
     hf_evt <- NULL
@@ -1030,7 +1030,7 @@ server <- function(input, output, session) {
     build_probe_domains <- function(hd_dt) {
       if (is.null(hd_dt) || !nrow(hd_dt)) return(data.table())
       hd_dt <- as.data.table(hd_dt)
-      req_cols <- c("event_id", "event_type", "gene_id", "transcript_id_inc", "transcript_id_exc",
+      req_cols <- c("event_id", "event_type_inc", "gene_id_inc", "transcript_id_inc", "transcript_id_exc",
                     "inc_only_domains_list", "exc_only_domains_list", "either_domains_list")
       missing <- setdiff(req_cols, names(hd_dt))
       if (length(missing)) {
@@ -1039,12 +1039,12 @@ server <- function(input, output, session) {
       }
       expand_dir <- function(list_col, tx_col, direction_label) {
         out <- hd_dt[, .(
-          event_id, event_type, gene_id,
+          event_id, event_type_inc, gene_id_inc,
           transcript_id = get(tx_col),
           domain_vec = get(list_col)
         )]
         out <- out[!vapply(domain_vec, is.null, logical(1))]
-        out <- out[, .(domain_id = as.character(unlist(domain_vec, use.names = FALSE))), by = .(event_id, event_type, gene_id, transcript_id)]
+        out <- out[, .(domain_id = as.character(unlist(domain_vec, use.names = FALSE))), by = .(event_id, event_type_inc, gene_id_inc, transcript_id)]
         out <- out[!is.na(domain_id) & nzchar(domain_id)]
         out[, direction := direction_label]
         out[]
@@ -1067,7 +1067,7 @@ server <- function(input, output, session) {
     
     list(
       transcripts = if (!is.null(hf_evt) && nrow(hf_evt)) {
-        keep <- intersect(c("event_id", "event_type", "gene_id", "transcript_id_inc", "transcript_id_exc",
+        keep <- intersect(c("event_id", "event_type", "gene_id_inc", "transcript_id_inc", "transcript_id_exc",
                             "ensembl_peptide_id_inc", "ensembl_peptide_id_exc", "frame_category"), names(hf_evt))
         hf_evt[, ..keep]
       } else if (nrow(cons_evt)) {
