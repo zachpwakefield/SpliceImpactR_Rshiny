@@ -239,7 +239,7 @@ ui <- fluidPage(
         ),
         tabPanel(
           "Event probe",
-          helpText("Probe PSI by gene, event type, and event ID drawn from DI results and splicing table."),
+          helpText("Probe PSI by selecting a gene, then an event type, then (if needed) an event ID for non-AFE/ALE events."),
           selectizeInput("probe_gene", "Gene", choices = NULL, options = list(placeholder = "Select gene")),
           selectInput("probe_event_type", "Event type", choices = c(""), selected = NULL),
           selectizeInput("probe_event", "Event ID", choices = NULL, options = list(placeholder = "Select event_id")),
@@ -685,7 +685,6 @@ server <- function(input, output, session) {
       req(rv$di_sig)
       matched <- get_matched_events_chunked(rv$di_sig, rv$annotations$annotations, chunk_size = 2000)
       rv$matched <- as.data.table(matched)
-      updateSelectizeInput(session, "probe_event", choices = unique(rv$di_norm$event_id), server = TRUE)
       incProgress(1, detail = "Mapping complete")
     })
   })
@@ -1308,19 +1307,66 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE)
   }, ignoreNULL = TRUE)
   
-  probe_choices <- reactive({
-    di_events <- if (!is.null(rv$di_norm)) unique(rv$di_norm$event_id) else character(0)
-    hit_events <- if (!is.null(rv$splicing)) unique(rv$splicing$event_id) else character(0)
-    choices <- intersect(di_events, hit_events)
-    if (!length(choices) && length(di_events)) choices <- di_events
-    sort(unique(choices))
+  probe_events_dt <- reactive({
+    if (is.null(rv$di_norm) || is.null(rv$splicing)) return(data.table())
+    di <- as.data.table(rv$di_norm)
+    sp <- as.data.table(rv$splicing)
+    if (!("event_id" %in% names(di)) || !("event_id" %in% names(sp))) return(data.table())
+    allowed <- intersect(unique(di$event_id), unique(sp$event_id))
+    if (!length(allowed)) return(data.table())
+    di_sub <- di[event_id %in% allowed, .(event_id, gene_id, event_type)]
+    sp_sub <- sp[event_id %in% allowed, .(event_id, gene_id, event_type)]
+    combined <- rbindlist(list(di_sub, sp_sub), use.names = TRUE, fill = TRUE)
+    unique(combined[!is.na(event_id) & !is.na(gene_id) & !is.na(event_type)])
   })
   
-  observeEvent(probe_choices(), {
-    choices <- probe_choices()
-    current <- isolate(input$probe_event)
-    selected <- if (!is.null(current) && nzchar(current) && current %chin% choices) current else NULL
-    updateSelectizeInput(session, "probe_event", choices = choices, server = TRUE, selected = selected)
+  observeEvent(probe_events_dt(), {
+    pe <- probe_events_dt()
+    gene_choices <- sort(unique(pe$gene_id))
+    current_gene <- isolate(input$probe_gene)
+    selected_gene <- if (!is.null(current_gene) && nzchar(current_gene) && current_gene %chin% gene_choices) current_gene else NULL
+    updateSelectizeInput(session, "probe_gene", choices = gene_choices, server = TRUE, selected = selected_gene)
+    if (is.null(selected_gene)) {
+      updateSelectInput(session, "probe_event_type", choices = character(0), selected = NULL)
+      updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE, selected = NULL)
+    } else {
+      types <- sort(unique(pe[gene_id == selected_gene, event_type]))
+      current_type <- isolate(input$probe_event_type)
+      selected_type <- if (!is.null(current_type) && nzchar(current_type) && current_type %chin% types) current_type else if (length(types)) types[1] else NULL
+      updateSelectInput(session, "probe_event_type", choices = types, selected = selected_type)
+    }
+  })
+  
+  observeEvent(input$probe_gene, {
+    pe <- probe_events_dt()
+    if (!nrow(pe) || !nzchar(input$probe_gene)) {
+      updateSelectInput(session, "probe_event_type", choices = character(0), selected = NULL)
+      updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    types <- sort(unique(pe[gene_id == input$probe_gene, event_type]))
+    current_type <- isolate(input$probe_event_type)
+    selected_type <- if (!is.null(current_type) && nzchar(current_type) && current_type %chin% types) current_type else if (length(types)) types[1] else NULL
+    updateSelectInput(session, "probe_event_type", choices = types, selected = selected_type)
+  }, ignoreInit = TRUE)
+  
+  observeEvent(list(input$probe_gene, input$probe_event_type), {
+    pe <- probe_events_dt()
+    gene <- input$probe_gene
+    evt_type <- input$probe_event_type
+    if (!nrow(pe) || !nzchar(gene) || !nzchar(evt_type)) {
+      updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    event_choices <- sort(unique(pe[gene_id == gene & event_type == evt_type, event_id]))
+    current_evt <- isolate(input$probe_event)
+    selected_evt <- if (!is.null(current_evt) && nzchar(current_evt) && current_evt %chin% event_choices) current_evt else NULL
+    if (length(event_choices) == 1 && is.null(selected_evt)) selected_evt <- event_choices
+    if (evt_type %chin% c("AFE", "ALE")) {
+      updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE, selected = NULL)
+    } else {
+      updateSelectizeInput(session, "probe_event", choices = event_choices, server = TRUE, selected = selected_evt)
+    }
   }, ignoreInit = TRUE)
   
   observeEvent(input$pair_gene, {
@@ -1333,15 +1379,41 @@ server <- function(input, output, session) {
   
   probe_event_plot <- eventReactive(input$run_probe, {
     req(rv$di_norm, rv$splicing)
-    evt <- input$probe_event
-    if (!nzchar(evt)) {
-      showNotification("Select an event ID to probe.", type = "warning")
+    pe <- probe_events_dt()
+    if (!nrow(pe)) {
+      showNotification("No overlapping events between DI results and splicing table.", type = "warning")
       return(NULL)
     }
-    allowed <- intersect(unique(rv$di_norm$event_id), unique(rv$splicing$event_id))
-    if (!evt %chin% allowed) {
-      showNotification("Pick an event present in both DI results and the splicing table.", type = "warning")
+    gene <- input$probe_gene
+    evt_type <- input$probe_event_type
+    if (!nzchar(gene)) {
+      showNotification("Select a gene to probe.", type = "warning")
       return(NULL)
+    }
+    if (!nzchar(evt_type)) {
+      showNotification("Select an event type to probe.", type = "warning")
+      return(NULL)
+    }
+    candidates <- pe[gene_id == gene & event_type == evt_type, unique(event_id)]
+    if (!length(candidates)) {
+      showNotification("No events found for the selected gene and event type.", type = "warning")
+      return(NULL)
+    }
+    evt <- input$probe_event
+    if (evt_type %chin% c("AFE", "ALE")) {
+      evt <- candidates[1]
+    } else {
+      if (!nzchar(evt) && length(candidates) == 1) {
+        evt <- candidates
+      }
+      if (!nzchar(evt)) {
+        showNotification("Select an event ID for this gene and event type.", type = "warning")
+        return(NULL)
+      }
+      if (!evt %chin% candidates) {
+        showNotification("Pick an event present for this gene and event type.", type = "warning")
+        return(NULL)
+      }
     }
     tryCatch(
       probe_individual_event(rv$splicing, event = evt),
