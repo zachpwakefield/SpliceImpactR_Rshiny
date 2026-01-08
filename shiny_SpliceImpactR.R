@@ -287,6 +287,7 @@ ui <- fluidPage(
           downloadButton("download_length_plot", "Download length plot"),
           h4("Domain enrichment"),
           plotOutput("domain_plot", height = 400),
+          textOutput("domain_enrichment_message"),
           downloadButton("download_domain_plot", "Download domain plot"),
           tableOutput("domain_table")
         ),
@@ -1381,7 +1382,7 @@ server <- function(input, output, session) {
         ), error = function(e) {showNotification(paste("get_background failed:", e$message), type = "error"); NULL})
         bg <- as_dt_or_null(bg)
         if (has_df_rows(bg)) {
-          enriched_domains <- tryCatch(enrich_domains_hypergeo(hits_domain, bg, db_filter = "interpro"),
+          enriched_domains <- tryCatch(enrich_domains_hypergeo(hits_domain, bg),
                                        error = function(e) NULL)
           enriched_domains <- as_dt_or_null(enriched_domains)
           if (has_df_rows(enriched_domains)) {
@@ -1496,6 +1497,15 @@ server <- function(input, output, session) {
     res <- downstream_results()
     if (is.null(res) || is.null(res$domain_plot)) return(NULL)
     res$domain_plot
+  })
+
+  output$domain_enrichment_message <- renderText({
+    res <- downstream_results()
+    if (is.null(res)) return(NULL)
+    if (is.null(res$enriched_domains) || !has_df_rows(res$enriched_domains)) {
+      return("No domain enrichment results available for this selection.")
+    }
+    NULL
   })
   
   output$proximal_plot <- renderPlot({
