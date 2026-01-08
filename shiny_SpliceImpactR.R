@@ -296,6 +296,13 @@ ui <- fluidPage(
           textInput("ppi_gene_filter", "Gene filter (PPI tab)", value = "", placeholder = "Overrides global gene filter"),
           helpText("Run sequence/domain plots with PPIs loaded to populate this tab."),
           helpText("n_ppi = total unique partner transcripts per event (from PPIDM). partners = sample of partner transcript IDs."),
+          h5("Probe PPIs by event"),
+          helpText("Select gene → event type → event to list inclusion/exclusion partners."),
+          selectizeInput("ppi_probe_gene", "Gene", choices = NULL, options = list(placeholder = "Select gene")),
+          selectInput("ppi_probe_event_type", "Event type", choices = c(""), selected = NULL),
+          selectizeInput("ppi_probe_event", "Event ID", choices = NULL, options = list(placeholder = "Select event_id")),
+          actionButton("run_ppi_probe", "Probe PPI partners", width = "100%"),
+          tableOutput("ppi_probe_table"),
           h4("PPI impact summary"),
           plotOutput("ppi_plot", height = 350),
           downloadButton("download_ppi_plot", "Download PPI plot"),
@@ -418,6 +425,33 @@ server <- function(input, output, session) {
     rep(NA_character_, nrow(dt))
   }
   
+  count_coords <- function(x) {
+    vals <- as.character(x)
+    vals <- vals[!is.na(vals) & nzchar(vals)]
+    if (!length(vals)) return(0L)
+    split_vals <- unlist(strsplit(vals, "[|,;]"))
+    split_vals <- trimws(split_vals)
+    sum(nzchar(split_vals))
+  }
+  pick_event_coords <- function(inc, exc) {
+    inc_val <- if (!is.na(inc) && nzchar(inc)) inc else NA_character_
+    exc_val <- if (!is.na(exc) && nzchar(exc)) exc else NA_character_
+    if (is.na(inc_val) && is.na(exc_val)) return(NA_character_)
+    if (is.na(inc_val)) return(exc_val)
+    if (is.na(exc_val)) return(inc_val)
+    if (count_coords(inc_val) >= count_coords(exc_val)) inc_val else exc_val
+  }
+  normalize_chr <- function(chr) {
+    if (is.na(chr) || !nzchar(chr)) return(NA_character_)
+    if (startsWith(chr, "chr")) chr else paste0("chr", chr)
+  }
+  format_coord_label <- function(chr, coord) {
+    if (is.na(coord) || !nzchar(coord)) return(NA_character_)
+    if (grepl("(^|[|,;\\s])chr", coord) || grepl("^[0-9XYM]+:", coord)) return(coord)
+    chr_norm <- normalize_chr(chr)
+    if (is.na(chr_norm)) return(coord)
+    paste0(chr_norm, ": ", coord)
+  }
   collapse_list_vals <- function(x, n = 5) {
     vals <- as.character(unlist(x))
     vals <- vals[nzchar(vals) & !is.na(vals)]
@@ -1242,6 +1276,135 @@ server <- function(input, output, session) {
     hf
   })
   
+  ppi_probe_events_dt <- reactive({
+    hf <- ppi_results()
+    if (!nrow(hf)) return(data.table())
+    for (c in c("inc_inc", "exc_inc", "chr")) {
+      if (!c %in% names(hf)) hf[, (c) := NA_character_]
+    }
+    coord_lookup <- unique(hf[, .(event_id, gene_id = gene_for_plot, event_type, chr, inc_inc, exc_inc, n_ppi)])
+    coord_lookup[, coord := mapply(pick_event_coords, inc_inc, exc_inc)]
+    coord_lookup[, coord := mapply(format_coord_label, chr, coord)]
+    unique(coord_lookup[
+      !is.na(event_id) & nzchar(event_id) &
+        !is.na(gene_id) & nzchar(gene_id) &
+        !is.na(event_type) & nzchar(event_type) &
+        n_ppi > 0,
+      .(event_id, gene_id, event_type, coord)
+    ])
+  })
+  
+  observeEvent(ppi_probe_events_dt(), {
+    pe <- ppi_probe_events_dt()
+    gene_choices <- sort(unique(pe$gene_id))
+    current_gene <- isolate(input$ppi_probe_gene)
+    selected_gene <- if (!is.null(current_gene) && nzchar(current_gene) && current_gene %chin% gene_choices) current_gene else NULL
+    updateSelectizeInput(session, "ppi_probe_gene", choices = gene_choices, server = TRUE, selected = selected_gene)
+    if (is.null(selected_gene)) {
+      updateSelectInput(session, "ppi_probe_event_type", choices = character(0), selected = NULL)
+      updateSelectizeInput(session, "ppi_probe_event", choices = character(0), server = TRUE, selected = NULL)
+    } else {
+      types <- sort(unique(pe[gene_id == selected_gene, event_type]))
+      current_type <- isolate(input$ppi_probe_event_type)
+      selected_type <- if (!is.null(current_type) && nzchar(current_type) && current_type %chin% types) current_type else if (length(types)) types[1] else NULL
+      updateSelectInput(session, "ppi_probe_event_type", choices = types, selected = selected_type)
+    }
+  })
+  
+  observeEvent(input$ppi_probe_gene, {
+    pe <- ppi_probe_events_dt()
+    if (!nrow(pe) || !nzchar(input$ppi_probe_gene)) {
+      updateSelectInput(session, "ppi_probe_event_type", choices = character(0), selected = NULL)
+      updateSelectizeInput(session, "ppi_probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    types <- sort(unique(pe[gene_id == input$ppi_probe_gene, event_type]))
+    current_type <- isolate(input$ppi_probe_event_type)
+    selected_type <- if (!is.null(current_type) && nzchar(current_type) && current_type %chin% types) current_type else if (length(types)) types[1] else NULL
+    updateSelectInput(session, "ppi_probe_event_type", choices = types, selected = selected_type)
+  }, ignoreInit = TRUE)
+  
+  observeEvent(list(input$ppi_probe_gene, input$ppi_probe_event_type), {
+    pe <- ppi_probe_events_dt()
+    gene <- input$ppi_probe_gene
+    evt_type <- input$ppi_probe_event_type
+    if (!nrow(pe) || !nzchar(gene) || !nzchar(evt_type)) {
+      updateSelectizeInput(session, "ppi_probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    event_table <- unique(pe[gene_id == gene & event_type == evt_type, .(event_id, coord)])
+    if (!nrow(event_table)) {
+      updateSelectizeInput(session, "ppi_probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    event_table <- event_table[order(event_id)]
+    event_table[, label := fifelse(!is.na(coord) & nzchar(coord), paste0(event_id, " (", coord, ")"), event_id)]
+    event_choices <- stats::setNames(event_table$event_id, event_table$label)
+    current_evt <- isolate(input$ppi_probe_event)
+    selected_evt <- if (!is.null(current_evt) && nzchar(current_evt) && current_evt %chin% event_table$event_id) current_evt else NULL
+    if (length(event_table$event_id) == 1 && is.null(selected_evt)) selected_evt <- event_table$event_id
+    updateSelectizeInput(session, "ppi_probe_event", choices = event_choices, server = TRUE, selected = selected_evt)
+  }, ignoreInit = TRUE)
+  
+  ppi_probe_results <- eventReactive(input$run_ppi_probe, {
+    hf <- ppi_results()
+    if (!nrow(hf)) {
+      showNotification("Run sequence/domain plots with PPIs loaded to populate PPI results.", type = "warning")
+      return(NULL)
+    }
+    gene <- input$ppi_probe_gene
+    evt_type <- input$ppi_probe_event_type
+    evt <- input$ppi_probe_event
+    if (!nzchar(gene)) {
+      showNotification("Select a gene to probe PPIs.", type = "warning")
+      return(NULL)
+    }
+    if (!nzchar(evt_type)) {
+      showNotification("Select an event type to probe PPIs.", type = "warning")
+      return(NULL)
+    }
+    allowed <- hf[gene_for_plot == gene & event_type == evt_type & n_ppi > 0, unique(event_id)]    
+    if (!length(allowed)) {
+      showNotification("No PPI events found for this gene and event type.", type = "warning")
+      return(NULL)
+    }
+    if (!nzchar(evt)) {
+      if (length(allowed) == 1) {
+        evt <- allowed
+      } else {
+        showNotification("Select an event ID to probe PPIs.", type = "warning")
+        return(NULL)
+      }
+    }
+    if (!evt %chin% allowed) {
+      showNotification("Pick an event present for this gene and event type.", type = "warning")
+      return(NULL)
+    }
+    hf_evt <- hf[event_id == evt & gene_for_plot == gene & event_type == evt_type]
+    if (!nrow(hf_evt)) {
+      showNotification("No PPI partners found for the selected event.", type = "warning")
+      return(NULL)
+    }
+    hf_evt[, .(
+      event_id,
+      event_type,
+      gene_id = gene_for_plot,
+      transcript_id_inc,
+      transcript_id_exc,
+      n_inc_ppi,
+      n_exc_ppi,
+      n_ppi,
+      inc_ppi = vapply(inc_ppi, collapse_list_vals, character(1)),
+      exc_ppi = vapply(exc_ppi, collapse_list_vals, character(1))
+    )]
+  })
+  
+  output$ppi_probe_table <- renderTable({
+    res <- ppi_probe_results()
+    if (is.null(res)) return(NULL)
+    res
+  })
+  
   ppi_plot_obj <- reactive({
     hf <- ppi_results()
     if (!nrow(hf)) return(NULL)
@@ -1637,6 +1800,9 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "tx_a", choices = character(0), server = TRUE)
     updateSelectizeInput(session, "tx_b", choices = character(0), server = TRUE)
     updateSelectizeInput(session, "probe_event", choices = character(0), server = TRUE)
+    updateSelectizeInput(session, "ppi_probe_gene", choices = gene_choices, server = TRUE)
+    updateSelectInput(session, "ppi_probe_event_type", choices = character(0), selected = NULL)
+    updateSelectizeInput(session, "ppi_probe_event", choices = character(0), server = TRUE)
     updateSelectizeInput(session, "protein_probe_gene", choices = gene_choices, server = TRUE)
     updateSelectInput(session, "protein_probe_event_type", choices = character(0), selected = NULL)
     updateSelectizeInput(session, "protein_probe_event", choices = character(0), server = TRUE)
@@ -1714,10 +1880,30 @@ server <- function(input, output, session) {
   
   protein_probe_events_dt <- reactive({
     cons <- protein_consequences()
-    if (is.null(cons) || !nrow(cons)) return(data.table())
-    cons[, .(event_id, gene_id, event_type)][
+    res <- downstream_results()
+    if (is.null(cons) || !nrow(cons) || is.null(res) || is.null(res$hits_domain) || !nrow(res$hits_domain)) {
+      return(data.table())
+    }
+    cons_events <- cons[, .(event_id, gene_id, event_type)][
       !is.na(event_id) & nzchar(event_id) & !is.na(gene_id) & nzchar(gene_id) & !is.na(event_type) & nzchar(event_type)][
         , unique(.SD)]
+    
+    hd <- as.data.table(res$hits_domain)
+    for (c in c("event_id", "inc_inc", "exc_inc")) {
+      if (!c %in% names(hd)) hd[, (c) := NA_character_]
+    }
+    hd[, `:=`(
+      gene_id = first_available(hd, c("gene_id_inc", "gene_id_exc", "gene_id")),
+      event_type = first_available(hd, c("event_type_inc", "event_type_exc", "event_type")),
+      chr = first_available(hd, c("chr", "chr_inc", "chr_exc"))
+    )]
+    coord_lookup <- unique(hd[, .(event_id, gene_id, event_type, chr, inc_inc, exc_inc)])
+    coord_lookup[, coord := mapply(pick_event_coords, inc_inc, exc_inc)]
+    coord_lookup[, coord := mapply(format_coord_label, chr, coord)]
+    
+    merge(cons_events, coord_lookup[, .(event_id, gene_id, event_type, coord)],
+          by = c("event_id", "gene_id", "event_type"),
+          all.x = TRUE)
   })
   
   
@@ -1759,10 +1945,17 @@ server <- function(input, output, session) {
       updateSelectizeInput(session, "protein_probe_event", choices = character(0), server = TRUE, selected = NULL)
       return()
     }
-    event_choices <- sort(unique(pe[gene_id == gene & event_type == evt_type, event_id]))
+    event_table <- unique(pe[gene_id == gene & event_type == evt_type, .(event_id, coord)])
+    if (!nrow(event_table)) {
+      updateSelectizeInput(session, "protein_probe_event", choices = character(0), server = TRUE, selected = NULL)
+      return()
+    }
+    event_table <- event_table[order(event_id)]
+    event_table[, label := fifelse(!is.na(coord) & nzchar(coord), paste0(event_id, " (", coord, ")"), event_id)]
+    event_choices <- stats::setNames(event_table$event_id, event_table$label)
     current_evt <- isolate(input$protein_probe_event)
-    selected_evt <- if (!is.null(current_evt) && nzchar(current_evt) && current_evt %chin% event_choices) current_evt else NULL
-    if (length(event_choices) == 1 && is.null(selected_evt)) selected_evt <- event_choices
+    selected_evt <- if (!is.null(current_evt) && nzchar(current_evt) && current_evt %chin% event_table$event_id) current_evt else NULL
+    if (length(event_table$event_id) == 1 && is.null(selected_evt)) selected_evt <- event_table$event_id
     updateSelectizeInput(session, "protein_probe_event", choices = event_choices, server = TRUE, selected = selected_evt)
   }, ignoreInit = TRUE)
   
