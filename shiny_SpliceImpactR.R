@@ -287,6 +287,7 @@ ui <- fluidPage(
           downloadButton("download_length_plot", "Download length plot"),
           h4("Domain enrichment"),
           plotOutput("domain_plot", height = 400),
+          textOutput("domain_enrichment_message"),
           downloadButton("download_domain_plot", "Download domain plot"),
           tableOutput("domain_table")
         ),
@@ -341,7 +342,8 @@ ui <- fluidPage(
           helpText("Export full tables for follow-up in your own scripts."),
           downloadButton("download_di", "Download differential inclusion results"),
           downloadButton("download_mapping", "Download event-to-transcript map"),
-          downloadButton("download_proteins", "Download protein consequence table")
+          downloadButton("download_proteins", "Download protein consequence table"),
+          downloadButton("download_hits_final", "Download hits_final with PPIs")
         )
       )
     )
@@ -1207,6 +1209,17 @@ server <- function(input, output, session) {
     }
   )
   
+  output$download_hits_final <- downloadHandler(
+    filename = function() paste0("spliceimpactr_hits_final_", Sys.Date(), ".csv"),
+    content = function(file) {
+      res <- downstream_results()
+      req(res)
+      hf <- as_dt_or_null(res$hits_final)
+      req(has_df_rows(hf))
+      fwrite(hf, file)
+    }
+  )
+  
   ppi_results <- reactive({
     res <- downstream_results()
     if (is.null(res) || is.null(res$hits_final) || !nrow(res$hits_final)) {
@@ -1377,7 +1390,7 @@ server <- function(input, output, session) {
         ), error = function(e) {showNotification(paste("get_background failed:", e$message), type = "error"); NULL})
         bg <- as_dt_or_null(bg)
         if (has_df_rows(bg)) {
-          enriched_domains <- tryCatch(enrich_domains_hypergeo(hits_domain, bg, db_filter = "interpro"),
+          enriched_domains <- tryCatch(enrich_domains_hypergeo(hits_domain, bg),
                                        error = function(e) NULL)
           enriched_domains <- as_dt_or_null(enriched_domains)
           if (has_df_rows(enriched_domains)) {
@@ -1492,6 +1505,15 @@ server <- function(input, output, session) {
     res <- downstream_results()
     if (is.null(res) || is.null(res$domain_plot)) return(NULL)
     res$domain_plot
+  })
+  
+  output$domain_enrichment_message <- renderText({
+    res <- downstream_results()
+    if (is.null(res)) return(NULL)
+    if (is.null(res$enriched_domains) || !has_df_rows(res$enriched_domains)) {
+      return("No domain enrichment results available for this selection.")
+    }
+    NULL
   })
   
   output$proximal_plot <- renderPlot({
