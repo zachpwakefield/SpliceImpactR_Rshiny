@@ -225,7 +225,6 @@ ui <- fluidPage(
           textInput("di_gene_filter", "Gene filter (DI tab)", value = "", placeholder = "Overrides global gene filter"),
           plotOutput("volcano", height = 400),
           downloadButton("download_di_plot", "Download volcano plot"),
-          verbatimTextOutput("di_colnames"),
           h4("Significant events"),
           tableOutput("di_table")
         ),
@@ -247,10 +246,6 @@ ui <- fluidPage(
           selectInput("protein_probe_event_type", "Event type", choices = c(""), selected = NULL),
           selectizeInput("protein_probe_event", "Event ID", choices = NULL, options = list(placeholder = "Select event_id")),
           actionButton("run_protein_probe", "Probe protein consequences", width = "100%"),
-          plotOutput("protein_plot", height = 350),
-          h4("Domain overlaps with inclusion exons"),
-          tableOutput("protein_summary"),
-          tableOutput("protein_gene_table"),
           h4("Single-gene transcript comparison"),
           helpText("When a single gene with exactly two transcripts is selected, shows shared vs. unique domains by database."),
           tableOutput("protein_pair_summary"),
@@ -258,6 +253,11 @@ ui <- fluidPage(
           h4("Event transcripts and domains"),
           tableOutput("protein_probe_tx_table"),
           tableOutput("protein_probe_domain_table"),
+          plotOutput("protein_plot", height = 350),
+          h4("Domain overlaps with inclusion exons"),
+          tableOutput("protein_summary"),
+          tableOutput("protein_gene_table"),
+          
           actionButton("show_protein_table", "Show full protein consequence table")
         ),
         tabPanel(
@@ -287,7 +287,6 @@ ui <- fluidPage(
           downloadButton("download_length_plot", "Download length plot"),
           h4("Domain enrichment"),
           plotOutput("domain_plot", height = 400),
-          textOutput("domain_enrichment_message"),
           downloadButton("download_domain_plot", "Download domain plot"),
           tableOutput("domain_table")
         ),
@@ -364,10 +363,6 @@ server <- function(input, output, session) {
   )
   downstream_results <- reactiveVal(NULL)
   
-  output$di_colnames <- renderPrint({
-    if (is.null(rv$di)) return("DI results not loaded yet.")
-    colnames(as.data.table(rv$di))
-  })
   apply_filters <- function(dt, gene_col = NULL, tx_col = NULL, prot_col = NULL, gene_override = NULL) {
     out <- as.data.table(dt)
     gene_col <- if (!is.null(gene_col) && gene_col %in% names(out)) gene_col else NULL
@@ -1382,7 +1377,7 @@ server <- function(input, output, session) {
         ), error = function(e) {showNotification(paste("get_background failed:", e$message), type = "error"); NULL})
         bg <- as_dt_or_null(bg)
         if (has_df_rows(bg)) {
-          enriched_domains <- tryCatch(enrich_domains_hypergeo(hits_domain, bg),
+          enriched_domains <- tryCatch(enrich_domains_hypergeo(hits_domain, bg, db_filter = "interpro"),
                                        error = function(e) NULL)
           enriched_domains <- as_dt_or_null(enriched_domains)
           if (has_df_rows(enriched_domains)) {
@@ -1497,15 +1492,6 @@ server <- function(input, output, session) {
     res <- downstream_results()
     if (is.null(res) || is.null(res$domain_plot)) return(NULL)
     res$domain_plot
-  })
-
-  output$domain_enrichment_message <- renderText({
-    res <- downstream_results()
-    if (is.null(res)) return(NULL)
-    if (is.null(res$enriched_domains) || !has_df_rows(res$enriched_domains)) {
-      return("No domain enrichment results available for this selection.")
-    }
-    NULL
   })
   
   output$proximal_plot <- renderPlot({
